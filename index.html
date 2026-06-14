@@ -380,6 +380,7 @@
           <span class="elev-info" id="elev-info">—</span>
           <button id="splice-btn" class="elev-fix-btn hidden" style="background:#7c3aed;border-color:#7c3aed">Splice gaps</button>
           <button id="pick-gap-btn" class="elev-fix-btn hidden" style="background:var(--surface);color:#7c3aed;border-color:#7c3aed">Pick gap</button>
+          <button id="spike-btn" class="elev-fix-btn hidden" style="background:var(--surface);color:#0891b2;border-color:#0891b2">Spike filter</button>
           <button id="fix-elev-btn" class="elev-fix-btn hidden">Fix elevation (pass 3)</button>
         </div>
       </div>
@@ -1200,6 +1201,96 @@ async function fixElevation() {
 }
 
 // ============================================================
+// SPIKE FILTER — remove single-point elevation outliers
+// ============================================================
+// SRTM (and barometric) data can return one wildly wrong cell, showing as a
+// single-point vertical spike. We flag any point whose elevation gradient to
+// BOTH neighbours exceeds SPIKE_GRADIENT (m per m of horizontal distance) with
+// the same sign of jump — i.e. it shoots up then back down (or vice versa)
+// over a span too short to be real road — and replace it with a
+// distance-weighted interpolation between its valid neighbours.
+const SPIKE_GRADIENT = 0.6;  // m rise per m run; road grades rarely exceed ~0.2
+const SPIKE_MIN_JUMP = 8;    // metres — ignore tiny jumps (normal noise)
+
+const spikeBtn = document.getElementById("spike-btn");
+spikeBtn.addEventListener("click", runSpikeFilter);
+
+function detectSpikes() {
+  const spikes = [];
+  for (let i = 1; i < elevData.length - 1; i++) {
+    const a = elevData[i-1], c = elevData[i], d = elevData[i+1];
+    if (a.ele === null || c.ele === null || d.ele === null) continue;
+
+    const dPrev = Math.max(c.dist - a.dist, 0.5);  // horizontal distance (avoid /0)
+    const dNext = Math.max(d.dist - c.dist, 0.5);
+    const jumpPrev = c.ele - a.ele;
+    const jumpNext = c.ele - d.ele;  // note: c minus next, so spike-up = both positive
+
+    // A spike: large jump away from BOTH neighbours in the same direction,
+    // exceeding the implausible-gradient threshold.
+    const sameDir = (jumpPrev > 0 && jumpNext > 0) || (jumpPrev < 0 && jumpNext < 0);
+    if (!sameDir) continue;
+    if (Math.abs(jumpPrev) < SPIKE_MIN_JUMP && Math.abs(jumpNext) < SPIKE_MIN_JUMP) continue;
+
+    const gradPrev = Math.abs(jumpPrev) / dPrev;
+    const gradNext = Math.abs(jumpNext) / dNext;
+    if (gradPrev > SPIKE_GRADIENT && gradNext > SPIKE_GRADIENT) {
+      spikes.push(i);
+    }
+  }
+  return spikes;
+}
+
+async function runSpikeFilter() {
+  if (!elevData.length || !jobId) return;
+  hide("warn-box");
+  spikeBtn.disabled = true;
+
+  const spikes = detectSpikes();
+  if (!spikes.length) {
+    spikeBtn.textContent = "No spikes found";
+    setTimeout(() => { spikeBtn.textContent = "Spike filter"; spikeBtn.disabled = false; }, 2500);
+    return;
+  }
+
+  // Replace each spike with distance-weighted interpolation of its neighbours.
+  // Build a corrected elevation array for the whole track.
+  const newEle = elevData.map(p => p.ele);
+  for (const i of spikes) {
+    const a = elevData[i-1], c = elevData[i], d = elevData[i+1];
+    const span = (d.dist - a.dist) || 1;
+    const f = (c.dist - a.dist) / span;
+    newEle[i] = a.ele + (d.ele - a.ele) * f;
+  }
+
+  // Apply locally + redraw
+  for (let i = 0; i < elevData.length; i++) elevData[i].ele = newEle[i];
+  computeElevStats();
+  layoutElev();
+  renderElevStatic();
+  renderElevCursor(elevCurIdx);
+  setElevGainLossLabel();
+
+  // Persist to backend (rebuild GPX with corrected elevation)
+  spikeBtn.textContent = "Saving…";
+  try {
+    await fetch(`${BACKEND_URL}/submit_elevation/${jobId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ele: newEle }),
+    });
+  } catch (e) {
+    showError("Saving spike-filtered elevation failed: " + e.message);
+    spikeBtn.disabled = false;
+    spikeBtn.textContent = "Spike filter";
+    return;
+  }
+
+  spikeBtn.textContent = `Removed ${spikes.length} spike${spikes.length === 1 ? "" : "s"} ✓`;
+  spikeBtn.classList.add("done");
+}
+
+// ============================================================
 // SPLICE GAPS — route across straight-line GPS dropouts
 // ============================================================
 // A dropout shows up as a long, near-straight run of kept-original (orange)
@@ -1484,6 +1575,9 @@ function renderResults(data) {
   pickGapBtn.classList.remove("hidden", "done");
   pickGapBtn.disabled = false;
   pickGapBtn.textContent = "Pick gap";
+  spikeBtn.classList.remove("hidden", "done");
+  spikeBtn.disabled = false;
+  spikeBtn.textContent = "Spike filter";
 }
 
 // ============================================================
@@ -1593,6 +1687,10 @@ function resetAll(full = true) {
   pickGapBtn.classList.add("hidden");
   pickGapBtn.disabled = false;
   pickGapBtn.textContent = "Pick gap";
+  spikeBtn.classList.add("hidden");
+  spikeBtn.classList.remove("done");
+  spikeBtn.disabled = false;
+  spikeBtn.textContent = "Spike filter";
 
   document.getElementById("progress-fill").style.width = "0%";
   fileInput.value = "";

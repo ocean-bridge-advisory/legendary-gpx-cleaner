@@ -175,22 +175,34 @@ def finalise_job(job_id):
     job = jobs[job_id]
     try:
         original_points = job["original_points_data"]
-        snapped_segments = job["snapped_segments"]   # seg_index -> list of {lat,lon} or None
-        segments = job["segments"]
 
-        # Build result point list
+        # New payload format: segments list with explicit start_idx/end_idx/result
+        data_segments = job.get("client_segments")  # [{start_idx, end_idx, result}]
+
+        if not data_segments:
+            # Fallback: old format
+            snapped_segments = job["snapped_segments"]
+            server_segments  = job["segments"]
+            data_segments = [
+                {
+                    "start_idx": s["start_idx"],
+                    "end_idx":   s["end_idx"],
+                    "result":    snapped_segments.get(str(i)),
+                }
+                for i, s in enumerate(server_segments)
+            ]
+
         result_points = []
-        segment_map = []  # per-point: "snapped" or "original"
+        segment_map   = []
 
-        for seg_i, seg in enumerate(segments):
-            start = seg["start_idx"]
-            end = seg["end_idx"]
-            snapped = snapped_segments.get(str(seg_i))
+        for seg_i, seg in enumerate(data_segments):
+            start   = seg["start_idx"]
+            end     = seg["end_idx"]
+            snapped = seg.get("result")  # list of {lat,lon} or None
 
             seg_original = original_points[start: end + 1]
 
             if snapped:
-                # Validate deviation: for each snapped point, find nearest original
                 max_dev = 0.0
                 for sp in snapped:
                     min_d = min(
@@ -198,61 +210,57 @@ def finalise_job(job_id):
                         for op in seg_original
                     )
                     max_dev = max(max_dev, min_d)
-
                 use_snapped = max_dev <= DEVIATION_THRESHOLD
             else:
                 use_snapped = False
 
-            # Skip duplicate first point (overlap) except for first segment
-            range_points = seg_original if seg_i == 0 else seg_original[1:]
-            tag = "snapped" if use_snapped else "original"
+            # Skip duplicate leading point for all segments after the first
+            range_original = seg_original if seg_i == 0 else seg_original[1:]
 
             if use_snapped:
                 pts_to_use = snapped if seg_i == 0 else snapped[1:]
                 for k, sp in enumerate(pts_to_use):
                     orig_idx = start + (0 if seg_i == 0 else 1) + k
-                    orig_idx = min(orig_idx, end)
-                    orig = original_points[min(orig_idx, len(original_points)-1)]
+                    orig = original_points[min(orig_idx, len(original_points) - 1)]
                     result_points.append({
-                        "lat": sp["lat"],
-                        "lon": sp["lon"],
-                        "ele": orig["ele"],
-                        "time": orig["time"],
+                        "lat":     sp["lat"],
+                        "lon":     sp["lon"],
+                        "ele":     orig["ele"],
+                        "time":    orig["time"],
                         "ext_xml": orig.get("ext_xml"),
                     })
                     segment_map.append("snapped")
             else:
-                for orig in range_points:
+                for orig in range_original:
                     result_points.append(orig)
                     segment_map.append("original")
 
-        # Summary stats
-        total_pts = len(segment_map)
-        snapped_pts = segment_map.count("snapped")
+        total_pts    = len(segment_map)
+        snapped_pts  = segment_map.count("snapped")
         unsnapped_pts = total_pts - snapped_pts
 
         result_coords = [(p["lat"], p["lon"]) for p in result_points]
-        result_dist = total_distance_m(result_coords)
+        result_dist   = total_distance_m(result_coords)
 
         gpx_xml = build_gpx(job["gpx_obj"], result_points)
 
-        job["result_gpx"] = gpx_xml
+        job["result_gpx"]    = gpx_xml
         job["result_points"] = [{"lat": p["lat"], "lon": p["lon"]} for p in result_points]
-        job["segment_map"] = segment_map
+        job["segment_map"]   = segment_map
         job["summary"] = {
-            "total_points": total_pts,
-            "snapped_points": snapped_pts,
-            "unsnapped_points": unsnapped_pts,
-            "snapped_pct": round(100 * snapped_pts / total_pts, 1) if total_pts else 0,
-            "unsnapped_pct": round(100 * unsnapped_pts / total_pts, 1) if total_pts else 0,
-            "total_distance_m": result_dist,
+            "total_points":       total_pts,
+            "snapped_points":     snapped_pts,
+            "unsnapped_points":   unsnapped_pts,
+            "snapped_pct":        round(100 * snapped_pts / total_pts, 1) if total_pts else 0,
+            "unsnapped_pct":      round(100 * unsnapped_pts / total_pts, 1) if total_pts else 0,
+            "total_distance_m":   result_dist,
             "original_distance_m": job.get("total_distance_m", 0),
         }
         job["status"] = "done"
 
     except Exception as e:
         job["status"] = "error"
-        job["error"] = str(e)
+        job["error"]  = str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +320,12 @@ def submit_snapped(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
     data = request.get_json()
-    job["snapped_segments"] = data.get("snapped_segments", {})
+    # New format: segments list with explicit indices and results
+    if "segments" in data:
+        job["client_segments"] = data["segments"]
+    else:
+        # Legacy fallback
+        job["snapped_segments"] = data.get("snapped_segments", {})
     t = threading.Thread(target=finalise_job, args=(job_id,), daemon=True)
     t.start()
     return jsonify({"ok": True})

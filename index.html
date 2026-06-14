@@ -379,6 +379,7 @@
         <div style="display:flex;align-items:center;gap:10px">
           <span class="elev-info" id="elev-info">—</span>
           <button id="splice-btn" class="elev-fix-btn hidden" style="background:#7c3aed;border-color:#7c3aed">Splice gaps</button>
+          <button id="pick-gap-btn" class="elev-fix-btn hidden" style="background:var(--surface);color:#7c3aed;border-color:#7c3aed">Pick gap</button>
           <button id="fix-elev-btn" class="elev-fix-btn hidden">Fix elevation (pass 3)</button>
         </div>
       </div>
@@ -500,17 +501,18 @@ async function handleFile(file) {
   const text = await file.text();
   const parser = new DOMParser();
   const doc    = parser.parseFromString(text, "application/xml");
-  const trkpts = doc.querySelectorAll("trkpt");
+  const trkpts = doc.getElementsByTagName("trkpt");
 
   if (!trkpts.length) { showError("No trackpoints found in this GPX file."); return; }
 
   const pts = Array.from(trkpts).map(t => {
-    const eleEl = t.querySelector("ele");
+    const eleEl = t.getElementsByTagName("ele")[0];
     const ele   = eleEl ? parseFloat(eleEl.textContent) : null;
+    const timeEl = t.getElementsByTagName("time")[0];
     return {
       lat:  parseFloat(t.getAttribute("lat")),
       lon:  parseFloat(t.getAttribute("lon")),
-      time: t.querySelector("time")?.textContent,
+      time: timeEl ? timeEl.textContent : undefined,
       ele:  Number.isFinite(ele) ? ele : null,
     };
   });
@@ -1071,10 +1073,12 @@ elevCanvas.addEventListener("click", e => {
   setElevCursor(lo);
 });
 
-// Map click → nearest result point
+// Map click → either elevation cursor, or manual-gap endpoint selection
 map.on("click", e => {
   if (!elevData.length) return;
-  setElevCursor(nearestIdxToLatLon(e.latlng.lat, e.latlng.lng));
+  const idx = nearestIdxToLatLon(e.latlng.lat, e.latlng.lng);
+  if (pickMode) { handlePickClick(idx); return; }
+  setElevCursor(idx);
 });
 
 // Redraw static layer on resize (debounced)
@@ -1100,12 +1104,18 @@ function initElevPanel(resultPts, elevArr) {
   elevSlider.value = 0;
   elevCurIdx       = 0;
 
-  show("elev-panel");          // must be visible before measuring offsetWidth
-  layoutElev();
-  renderElevStatic();
-  renderElevCursor(-1);        // static only, no cursor yet
-
+  show("elev-panel");          // make visible first
   setElevGainLossLabel();
+
+  // Defer measuring/drawing until the browser has laid out the now-visible
+  // panel; if width is still 0 (layout not settled), retry next frame.
+  const tryDraw = () => {
+    if (elevCanvas.offsetWidth === 0) { requestAnimationFrame(tryDraw); return; }
+    layoutElev();
+    renderElevStatic();
+    renderElevCursor(-1);
+  };
+  requestAnimationFrame(tryDraw);
 }
 
 // ============================================================
@@ -1249,43 +1259,13 @@ async function spliceGaps() {
     if (aborted) { spliceBtn.textContent = "Splice gaps"; spliceBtn.disabled = false; return; }
     const gap = gaps[g];
     spliceBtn.textContent = `Splicing… ${g + 1} / ${gaps.length}`;
-    const a = resultPtsGlobal[gap.start], b = resultPtsGlobal[gap.end];
-    const routed = await routeRaw([{ lat: a.lat, lon: a.lon }, { lat: b.lat, lon: b.lon }]);
-    if (routed && routed.length >= 2) {
-      routed[0]                 = { lat: a.lat, lon: a.lon }; // pin endpoints
-      routed[routed.length - 1] = { lat: b.lat, lon: b.lon };
-      splices.push({ start: gap.start, end: gap.end, points: routed });
-    } else {
-      failed.push(gap);
-    }
+    const routed = await routeGap(gap.start, gap.end);
+    if (routed) splices.push({ start: gap.start, end: gap.end, points: routed });
+    else        failed.push(gap);
   }
 
-  if (splices.length) {
-    spliceBtn.textContent = "Saving…";
-    let data;
-    try {
-      const res = await fetch(`${BACKEND_URL}/submit_splice/${jobId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ splices }),
-      });
-      data = await res.json();
-      if (!res.ok) throw new Error(data.error || "splice save failed");
-    } catch (e) {
-      showError("Splice save failed: " + e.message);
-      spliceBtn.disabled = false; spliceBtn.textContent = "Splice gaps";
-      return;
-    }
-
-    // Redraw with updated result
-    segMapGlobal    = data.segment_map   || segMapGlobal;
-    resultPtsGlobal = data.result_points || resultPtsGlobal;
-    drawTrackLayers(origPtsGlobal, resultPtsGlobal, segMapGlobal);
-    applySummary(data.summary || {});
-    if (data.result_points_ele && data.result_points_ele.some(e => e !== null)) {
-      initElevPanel(resultPtsGlobal, data.result_points_ele);
-    }
-  }
+  const ok = await submitSplices(splices, spliceBtn, "Splice gaps");
+  if (ok === false) return;
 
   if (failed.length) {
     const dists = failed.map(g => fmtDist(elevData[g.start] ? elevData[g.start].dist : 0)).join(", ");
@@ -1294,6 +1274,128 @@ async function spliceGaps() {
 
   spliceBtn.textContent = splices.length ? "Gaps spliced ✓" : "No road found";
   if (splices.length) spliceBtn.classList.add("done");
+}
+
+// Route the road between two result indices; pin endpoints. Returns geometry or null.
+async function routeGap(startIdx, endIdx) {
+  const a = resultPtsGlobal[startIdx], b = resultPtsGlobal[endIdx];
+  const routed = await routeRaw([{ lat: a.lat, lon: a.lon }, { lat: b.lat, lon: b.lon }]);
+  if (routed && routed.length >= 2) {
+    routed[0]                 = { lat: a.lat, lon: a.lon };
+    routed[routed.length - 1] = { lat: b.lat, lon: b.lon };
+    return routed;
+  }
+  return null;
+}
+
+// POST splices, redraw track/summary/elevation. Returns false on hard error.
+async function submitSplices(splices, btn, idleLabel) {
+  if (!splices.length) return true;
+  btn.textContent = "Saving…";
+  let data;
+  try {
+    const res = await fetch(`${BACKEND_URL}/submit_splice/${jobId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ splices }),
+    });
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || "splice save failed");
+  } catch (e) {
+    showError("Splice save failed: " + e.message);
+    btn.disabled = false; btn.textContent = idleLabel;
+    return false;
+  }
+
+  segMapGlobal    = data.segment_map   || segMapGlobal;
+  resultPtsGlobal = data.result_points || resultPtsGlobal;
+  drawTrackLayers(origPtsGlobal, resultPtsGlobal, segMapGlobal);
+  applySummary(data.summary || {});
+  if (data.result_points_ele && data.result_points_ele.some(e => e !== null)) {
+    initElevPanel(resultPtsGlobal, data.result_points_ele);
+  }
+  return true;
+}
+
+// ── Manual gap picking ──────────────────────────────────────
+let pickMode    = false;
+let pickStart   = null;   // first selected index
+let pickMarkers = [];     // temporary Leaflet markers for picked endpoints
+
+const pickGapBtn = document.getElementById("pick-gap-btn");
+pickGapBtn.addEventListener("click", togglePickMode);
+
+function togglePickMode() {
+  pickMode ? exitPickMode() : enterPickMode();
+}
+
+function enterPickMode() {
+  pickMode  = true;
+  pickStart = null;
+  clearPickMarkers();
+  pickGapBtn.classList.add("done");
+  pickGapBtn.textContent = "Click START on map";
+  document.getElementById("map").style.cursor = "crosshair";
+}
+
+function exitPickMode() {
+  pickMode = false;
+  pickStart = null;
+  clearPickMarkers();
+  pickGapBtn.classList.remove("done");
+  pickGapBtn.textContent = "Pick gap";
+  document.getElementById("map").style.cursor = "";
+}
+
+function clearPickMarkers() {
+  pickMarkers.forEach(m => map.removeLayer(m));
+  pickMarkers = [];
+}
+
+function addPickMarker(idx, label) {
+  const p = resultPtsGlobal[idx];
+  const icon = L.divIcon({
+    className: "",
+    html: `<div style="background:#7c3aed;color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 0 0 1px #7c3aed">${label}</div>`,
+    iconSize: [18, 18], iconAnchor: [9, 9],
+  });
+  const m = L.marker([p.lat, p.lon], { icon, interactive: false }).addTo(map);
+  pickMarkers.push(m);
+}
+
+async function handlePickClick(idx) {
+  if (pickStart === null) {
+    pickStart = idx;
+    addPickMarker(idx, "A");
+    pickGapBtn.textContent = "Click END on map";
+    return;
+  }
+
+  // Second click → route between the two
+  let s = pickStart, e = idx;
+  if (e < s) [s, e] = [e, s];
+  if (e - s < 1) { pickGapBtn.textContent = "Pick a wider gap"; return; }
+
+  addPickMarker(idx, "B");
+  pickGapBtn.textContent = "Routing…";
+  pickGapBtn.disabled = true;
+
+  const routed = await routeGap(s, e);
+  pickGapBtn.disabled = false;
+
+  if (!routed) {
+    showWarn(`No road route found between the two picked points (${fmtDist(elevData[s]?.dist || 0)}–${fmtDist(elevData[e]?.dist || 0)}).`);
+    exitPickMode();
+    return;
+  }
+
+  const ok = await submitSplices([{ start: s, end: e, points: routed }], pickGapBtn, "Pick gap");
+  exitPickMode();
+  if (ok !== false) {
+    pickGapBtn.textContent = "Gap spliced ✓";
+    pickGapBtn.classList.add("done");
+    setTimeout(() => { pickGapBtn.textContent = "Pick gap"; pickGapBtn.classList.remove("done"); }, 2500);
+  }
 }
 
 // Track + summary state reused by splice
@@ -1375,10 +1477,13 @@ function renderResults(data) {
     fixElevBtn.textContent = "Fix elevation (pass 3)";
   }
 
-  // Reveal splice button if any gaps look spliceable
+  // Reveal splice + manual pick buttons
   spliceBtn.classList.remove("hidden", "done");
   spliceBtn.disabled = false;
   spliceBtn.textContent = "Splice gaps";
+  pickGapBtn.classList.remove("hidden", "done");
+  pickGapBtn.disabled = false;
+  pickGapBtn.textContent = "Pick gap";
 }
 
 // ============================================================
@@ -1484,6 +1589,10 @@ function resetAll(full = true) {
   spliceBtn.classList.remove("done");
   spliceBtn.disabled = false;
   spliceBtn.textContent = "Splice gaps";
+  if (typeof exitPickMode === "function") exitPickMode();
+  pickGapBtn.classList.add("hidden");
+  pickGapBtn.disabled = false;
+  pickGapBtn.textContent = "Pick gap";
 
   document.getElementById("progress-fill").style.width = "0%";
   fileInput.value = "";

@@ -145,11 +145,6 @@ def process_job(job_id, gpx_bytes):
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
-        job["gpx_obj"] = gpx_obj
-
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
 
 
 def finalise_job(job_id):

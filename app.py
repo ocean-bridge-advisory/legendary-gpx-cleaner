@@ -221,9 +221,10 @@ def finalise_job(job_id):
 
         gpx_xml = build_gpx(job["gpx_obj"], result_points)
 
-        job["result_gpx"]    = gpx_xml
-        job["result_points"] = [{"lat": p["lat"], "lon": p["lon"]} for p in result_points]
-        job["segment_map"]   = segment_map
+        job["result_gpx"]         = gpx_xml
+        job["result_points"]      = [{"lat": p["lat"], "lon": p["lon"]} for p in result_points]
+        job["result_points_ele"]  = [p.get("ele") for p in result_points]
+        job["segment_map"]        = segment_map
         job["summary"] = {
             "total_points":       total_pts,
             "snapped_points":     snapped_pts,
@@ -279,6 +280,7 @@ def status(job_id):
 
     if job["status"] == "done":
         resp["result_points"] = job.get("result_points", [])
+        resp["result_points_ele"] = job.get("result_points_ele", [])
         resp["segment_map"] = job.get("segment_map", [])
         resp["summary"] = job.get("summary", {})
         resp["original_points"] = job.get("original_points", [])

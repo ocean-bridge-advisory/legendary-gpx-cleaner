@@ -58,6 +58,48 @@
     height: calc(100vh - 57px);
   }
 
+  /* ── Map column (right side): map + elevation stacked) ── */
+  .map-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* ── Elevation panel ── */
+  #elev-panel {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 10px 16px 12px;
+    flex-shrink: 0;
+    height: 180px;
+    position: relative;
+  }
+  #elev-panel.hidden { display: none !important; }
+  .elev-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .elev-title { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .elev-info  { font-size: .75rem; color: var(--muted); }
+  #elev-canvas { width: 100%; height: 110px; display: block; cursor: crosshair; }
+  #elev-slider-wrap { margin-top: 4px; }
+  #elev-slider {
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  /* Cursor marker on map */
+  .cursor-marker {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: #f59e0b;
+    border: 2px solid #fff;
+    box-shadow: 0 0 0 2px #f59e0b;
+  }
+
   /* ── Sidebar ── */
   .sidebar {
     background: var(--surface);
@@ -285,8 +327,22 @@
 
   </aside>
 
-  <!-- MAP -->
-  <div id="map"></div>
+  <!-- MAP + ELEVATION COLUMN -->
+  <div class="map-col">
+    <div id="map" style="flex:1;min-height:0;"></div>
+
+    <!-- Elevation panel (shown after results) -->
+    <div id="elev-panel" class="hidden">
+      <div class="elev-header">
+        <span class="elev-title">Elevation</span>
+        <span class="elev-info" id="elev-info">—</span>
+      </div>
+      <canvas id="elev-canvas"></canvas>
+      <div id="elev-slider-wrap">
+        <input type="range" id="elev-slider" min="0" value="0">
+      </div>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -324,7 +380,11 @@ let elapsedTimer = null;
 let elapsedSec   = 0;
 let startedAt    = null;
 let fileBlob     = null;
-let snapping     = false;  // guard: prevent double-trigger of snapAllSegments
+let snapping     = false;
+
+// Elevation state
+let elevData     = [];   // [{lat,lon,ele,dist}] — result points with cumulative distance
+let cursorMarker = null; // Leaflet marker for current position
 
 // ============================================================
 // DRAG & DROP
@@ -722,16 +782,254 @@ async function snapAllSegments(origPts) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ============================================================
-// RENDER RESULTS
+// ELEVATION MODULE
 // ============================================================
+// Performance design: the area/line/axes never change once the track is
+// loaded, so they are rendered ONCE to an offscreen canvas. Each cursor move
+// (slider drag, map click, graph click) just blits that bitmap and draws the
+// amber cursor on top — O(1) per frame instead of re-tracing every point.
+const elevCanvas    = document.getElementById("elev-canvas");
+const elevCtx       = elevCanvas.getContext("2d");
+const elevSlider    = document.getElementById("elev-slider");
+const elevStatic    = document.createElement("canvas");   // offscreen cache
+const elevStaticCtx = elevStatic.getContext("2d");
+
+let elevStats   = null;  // { eMin, eRange, dMax, firstValid, lastValid, gain, loss }
+let elevGeom    = null;  // { W, H, dpr, pad, cW, cH, xOf, yOf }
+let elevCurIdx  = 0;     // current cursor index
+let elevRaf     = 0;     // pending rAF handle for coalescing
+
+function buildElevData(resultPts, elevArr) {
+  elevData = new Array(resultPts.length);
+  let dist = 0, eMin = Infinity, eMax = -Infinity;
+  let firstValid = -1, lastValid = -1, gain = 0, loss = 0, prevEle = null;
+
+  for (let i = 0; i < resultPts.length; i++) {
+    if (i > 0) dist += haversine(resultPts[i-1].lat, resultPts[i-1].lon, resultPts[i].lat, resultPts[i].lon);
+    const ele = elevArr[i] ?? null;
+    elevData[i] = { lat: resultPts[i].lat, lon: resultPts[i].lon, ele, dist };
+
+    if (ele !== null) {
+      if (ele < eMin) eMin = ele;
+      if (ele > eMax) eMax = ele;
+      if (firstValid === -1) firstValid = i;
+      lastValid = i;
+      if (prevEle !== null) {
+        const d = ele - prevEle;
+        if (d > 0) gain += d; else loss -= d;
+      }
+      prevEle = ele;
+    }
+  }
+
+  elevStats = {
+    eMin, eRange: Math.max(eMax - eMin, 1),
+    dMax: dist || 1,
+    firstValid, lastValid, gain, loss,
+  };
+}
+
+// Compute geometry + size both canvases. Call on init and resize.
+function layoutElev() {
+  const W   = elevCanvas.offsetWidth;
+  const H   = elevCanvas.offsetHeight;
+  const dpr = window.devicePixelRatio || 1;
+
+  for (const c of [elevCanvas, elevStatic]) { c.width = W * dpr; c.height = H * dpr; }
+
+  const pad = { t: 4, b: 2, l: 38, r: 8 };
+  const cW  = W - pad.l - pad.r;
+  const cH  = H - pad.t - pad.b;
+  const { eMin, eRange, dMax } = elevStats;
+
+  elevGeom = {
+    W, H, dpr, pad, cW, cH,
+    xOf: d => pad.l + (d / dMax) * cW,
+    yOf: e => pad.t + cH - ((e - eMin) / eRange) * cH,
+  };
+}
+
+// Render static area + line + axes to the offscreen canvas (once per layout).
+function renderElevStatic() {
+  const { W, H, dpr, pad, cW, cH, xOf, yOf } = elevGeom;
+  const { eMin, eRange, firstValid, lastValid } = elevStats;
+  const ctx = elevStaticCtx;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  if (firstValid === -1) return;
+
+  // Filled area
+  ctx.beginPath();
+  ctx.moveTo(xOf(elevData[firstValid].dist), H - pad.b);
+  for (let i = firstValid; i <= lastValid; i++) {
+    const p = elevData[i];
+    if (p.ele === null) continue;
+    ctx.lineTo(xOf(p.dist), yOf(p.ele));
+  }
+  ctx.lineTo(xOf(elevData[lastValid].dist), H - pad.b);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+  grad.addColorStop(0, "rgba(37,99,235,.35)");
+  grad.addColorStop(1, "rgba(37,99,235,.05)");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  let started = false;
+  for (let i = firstValid; i <= lastValid; i++) {
+    const p = elevData[i];
+    if (p.ele === null) continue;
+    const x = xOf(p.dist), y = yOf(p.ele);
+    if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = "#2563eb";
+  ctx.lineWidth   = 1.5;
+  ctx.stroke();
+
+  // Y-axis labels + gridlines
+  ctx.fillStyle    = "#6b7280";
+  ctx.font         = "10px system-ui";
+  ctx.textAlign    = "right";
+  ctx.textBaseline = "middle";
+  const ticks = 4;
+  for (let t = 0; t <= ticks; t++) {
+    const e = eMin + (eRange * t / ticks);
+    const y = yOf(e);
+    ctx.fillText(Math.round(e) + "m", pad.l - 4, y);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + cW, y);
+    ctx.strokeStyle = "rgba(0,0,0,.06)";
+    ctx.lineWidth   = 1;
+    ctx.stroke();
+  }
+}
+
+// Blit static bitmap + draw cursor. O(1) — called on every cursor move.
+function renderElevCursor(idx) {
+  const { W, H, dpr, pad, xOf, yOf } = elevGeom;
+  const ctx = elevCtx;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);            // device px for 1:1 blit
+  ctx.clearRect(0, 0, elevCanvas.width, elevCanvas.height);
+  ctx.drawImage(elevStatic, 0, 0);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);        // back to CSS px
+
+  const p = elevData[idx];
+  if (!p || p.ele === null) return;
+  const x = xOf(p.dist);
+
+  ctx.beginPath();
+  ctx.moveTo(x, pad.t); ctx.lineTo(x, H - pad.b);
+  ctx.strokeStyle = "#f59e0b";
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([4, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.beginPath();
+  ctx.arc(x, yOf(p.ele), 4, 0, Math.PI * 2);
+  ctx.fillStyle   = "#f59e0b";
+  ctx.fill();
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth   = 1.5;
+  ctx.stroke();
+}
+
+function setElevCursor(idx) {
+  if (!elevData.length) return;
+  elevCurIdx = Math.max(0, Math.min(elevData.length - 1, idx));
+  const p = elevData[elevCurIdx];
+
+  elevSlider.value = elevCurIdx;
+  document.getElementById("elev-info").textContent =
+    `${p.ele !== null ? Math.round(p.ele) + " m" : "no elevation"}  ·  ${fmtDist(p.dist)}`;
+
+  // Coalesce rapid updates (slider drag) into one paint per frame
+  if (!elevRaf) elevRaf = requestAnimationFrame(() => { elevRaf = 0; renderElevCursor(elevCurIdx); });
+
+  // Reuse marker instead of remove/re-add
+  if (cursorMarker) {
+    cursorMarker.setLatLng([p.lat, p.lon]);
+  } else {
+    const icon = L.divIcon({ className: "", html: '<div class="cursor-marker"></div>', iconSize: [12, 12], iconAnchor: [6, 6] });
+    cursorMarker = L.marker([p.lat, p.lon], { icon, interactive: false }).addTo(map);
+  }
+}
+
+// Nearest result-point index to a lat/lon (linear; only runs on discrete clicks)
+function nearestIdxToLatLon(lat, lon) {
+  let best = 0, bestD = Infinity;
+  for (let i = 0; i < elevData.length; i++) {
+    const d = haversine(lat, lon, elevData[i].lat, elevData[i].lon);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+// Slider → cursor
+elevSlider.addEventListener("input", () => setElevCursor(parseInt(elevSlider.value, 10)));
+
+// Graph click → nearest by distance-along-track (binary search; data is sorted)
+elevCanvas.addEventListener("click", e => {
+  if (!elevData.length || !elevGeom) return;
+  const rect = elevCanvas.getBoundingClientRect();
+  const { pad, cW } = elevGeom;
+  const frac    = Math.max(0, Math.min(1, (e.clientX - rect.left - pad.l) / cW));
+  const dTarget = frac * elevStats.dMax;
+
+  let lo = 0, hi = elevData.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (elevData[mid].dist < dTarget) lo = mid + 1; else hi = mid;
+  }
+  if (lo > 0 && Math.abs(elevData[lo-1].dist - dTarget) < Math.abs(elevData[lo].dist - dTarget)) lo--;
+  setElevCursor(lo);
+});
+
+// Map click → nearest result point
+map.on("click", e => {
+  if (!elevData.length) return;
+  setElevCursor(nearestIdxToLatLon(e.latlng.lat, e.latlng.lng));
+});
+
+// Redraw static layer on resize (debounced)
+let elevResizeTimer = 0;
+window.addEventListener("resize", () => {
+  if (!elevData.length) return;
+  clearTimeout(elevResizeTimer);
+  elevResizeTimer = setTimeout(() => {
+    layoutElev();
+    renderElevStatic();
+    renderElevCursor(elevCurIdx);
+  }, 150);
+});
+
+function initElevPanel(resultPts, elevArr) {
+  buildElevData(resultPts, elevArr);
+  elevSlider.max   = elevData.length - 1;
+  elevSlider.value = 0;
+  elevCurIdx       = 0;
+
+  show("elev-panel");          // must be visible before measuring offsetWidth
+  layoutElev();
+  renderElevStatic();
+  renderElevCursor(-1);        // static only, no cursor yet
+
+  document.getElementById("elev-info").textContent =
+    `↑ ${Math.round(elevStats.gain)} m  ↓ ${Math.round(elevStats.loss)} m`;
+}
+
 function renderResults(data) {
   setStatus("done", "Complete");
   setProgress(100);
 
-  const origPts   = data.original_points || [];
-  const resultPts = data.result_points   || [];
-  const segMap    = data.segment_map     || [];
-  const summary   = data.summary         || {};
+  const origPts   = data.original_points   || [];
+  const resultPts = data.result_points     || [];
+  const elevArr   = data.result_points_ele || [];
+  const segMap    = data.segment_map       || [];
+  const summary   = data.summary           || {};
 
   // Redraw original (lighter)
   if (originalLayer) map.removeLayer(originalLayer);
@@ -748,7 +1046,6 @@ function renderResults(data) {
         if (curTag === "snapped") greenSegs.push([...curSeg]);
         else orangeSegs.push([...curSeg]);
       }
-      // carry last point for continuity
       curSeg = i > 0 ? [[resultPts[i-1].lat, resultPts[i-1].lon]] : [];
       curTag = tag;
     }
@@ -768,15 +1065,20 @@ function renderResults(data) {
   if (allBounds.length) map.fitBounds(L.latLngBounds(allBounds), { padding: [20, 20] });
 
   // Summary stats
-  document.getElementById("r-snapped").textContent    = `${summary.snapped_pct ?? 0}%`;
-  document.getElementById("r-unsnapped").textContent  = `${summary.unsnapped_pct ?? 0}%`;
-  document.getElementById("r-dist").textContent       = fmtDist(summary.total_distance_m || 0);
-  document.getElementById("r-orig-dist").textContent  = fmtDist(summary.original_distance_m || 0);
+  document.getElementById("r-snapped").textContent   = `${summary.snapped_pct ?? 0}%`;
+  document.getElementById("r-unsnapped").textContent = `${summary.unsnapped_pct ?? 0}%`;
+  document.getElementById("r-dist").textContent      = fmtDist(summary.total_distance_m || 0);
+  document.getElementById("r-orig-dist").textContent = fmtDist(summary.original_distance_m || 0);
 
   show("results-card");
   show("legend-card");
   show("download-btn");
   show("reset-btn");
+
+  // Elevation panel
+  if (resultPts.length && elevArr.some(e => e !== null)) {
+    initElevPanel(resultPts, elevArr);
+  }
 }
 
 // ============================================================
@@ -845,9 +1147,11 @@ function resetAll(full = true) {
   clearInterval(elapsedTimer);
   jobId    = null;
   snapping = false;
-  if (originalLayer)   { map.removeLayer(originalLayer);   originalLayer   = null; }
-  if (snappedLayer)    { map.removeLayer(snappedLayer);    snappedLayer    = null; }
-  if (unsnappedLayer)  { map.removeLayer(unsnappedLayer);  unsnappedLayer  = null; }
+  elevData = [];
+  if (cursorMarker)  { map.removeLayer(cursorMarker);  cursorMarker  = null; }
+  if (originalLayer)  { map.removeLayer(originalLayer);  originalLayer  = null; }
+  if (snappedLayer)   { map.removeLayer(snappedLayer);   snappedLayer   = null; }
+  if (unsnappedLayer) { map.removeLayer(unsnappedLayer); unsnappedLayer = null; }
 
   hide("file-summary");
   hide("status-card");
@@ -857,6 +1161,7 @@ function resetAll(full = true) {
   hide("reset-btn");
   hide("error-box");
   hide("elapsed-wrap");
+  hide("elev-panel");
 
   document.getElementById("progress-fill").style.width = "0%";
   fileInput.value = "";

@@ -298,11 +298,9 @@ const ORS_API_KEY      = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ij
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS  = 300_000; // 5 min
 const ORS_PROFILES     = ["driving-car", "cycling-road", "cycling-mountain"];
-const DEVIATION_LIMIT  = 25;  // metres — raised from 10 to handle GPS drift
-const SEGMENT_SIZE     = 50;  // waypoints per ORS request (ORS free tier max)
-const ORS_SLEEP_MS     = 150; // ms between requests (~6/s, safely under 40/min)
-const BEARING_THRESHOLD = 35; // degrees — junction detection turn threshold
-const JUNCTION_WINDOW   = 3;  // points to look ahead for bearing change
+const DEVIATION_LIMIT   = 25;   // metres
+const ORS_SLEEP_MS      = 1600; // 40 req/min = 1500ms min; 1600ms gives headroom
+const BEARING_THRESHOLD = 35;   // degrees — junction turn threshold
 
 // ============================================================
 // MAP INIT
@@ -496,10 +494,11 @@ async function handleStatus(data) {
 }
 
 // ============================================================
-// ORS SNAPPING (frontend)
+// ORS SNAPPING — TWO-PASS ENGINE
 // ============================================================
 
-// Bearing between two points (degrees, 0–360)
+// --- Geometry helpers ---
+
 function bearing(lat1, lon1, lat2, lon2) {
   const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
   const Δλ = (lon2 - lon1) * Math.PI / 180;
@@ -513,140 +512,185 @@ function bearingDiff(a, b) {
   return d > 180 ? 360 - d : d;
 }
 
-// Detect junction indices: points where bearing changes sharply
-// Returns a Set of point indices that should be hard segment boundaries
+// --- Junction detection ---
+// Returns sorted array of point indices that are junction boundaries.
+// Always includes 0 and pts.length-1.
+// Merges junctions within MIN_JUNCTION_GAP points of each other to avoid
+// micro-segments on tight bends.
+const MIN_JUNCTION_GAP = 5;
+
 function detectJunctions(pts) {
-  const junctions = new Set([0, pts.length - 1]);
-  for (let i = 1; i < pts.length - JUNCTION_WINDOW; i++) {
-    const b1 = bearing(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
-    const b2 = bearing(pts[i].lat, pts[i].lon, pts[i+1].lat, pts[i+1].lon);
-    if (bearingDiff(b1, b2) >= BEARING_THRESHOLD) {
-      junctions.add(i);
+  const raw = [0];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const b1 = bearing(pts[i-1].lat, pts[i-1].lon, pts[i].lat,   pts[i].lon);
+    const b2 = bearing(pts[i].lat,   pts[i].lon,   pts[i+1].lat, pts[i+1].lon);
+    if (bearingDiff(b1, b2) >= BEARING_THRESHOLD) raw.push(i);
+  }
+  raw.push(pts.length - 1);
+
+  // Merge junctions too close together
+  const merged = [raw[0]];
+  for (let i = 1; i < raw.length; i++) {
+    if (raw[i] - merged[merged.length - 1] >= MIN_JUNCTION_GAP) {
+      merged.push(raw[i]);
     }
   }
-  return junctions;
+  if (merged[merged.length - 1] !== pts.length - 1) merged.push(pts.length - 1);
+  return merged;
 }
 
-// Split points into segments of max SEGMENT_SIZE, always breaking at junctions.
-// Segments overlap by exactly 1 point (shared boundary).
-function buildSegments(pts) {
-  const junctions = detectJunctions(pts);
-  const segments = [];
-  let start = 0;
-
-  while (start < pts.length - 1) {
-    let end = Math.min(start + SEGMENT_SIZE - 1, pts.length - 1);
-
-    // If there's a junction within [start+2 .. end], prefer that as the break point
-    // so the junction point is the exact end of this segment and start of next
-    let junctionEnd = -1;
-    for (let k = start + 2; k <= end; k++) {
-      if (junctions.has(k)) { junctionEnd = k; break; }
-    }
-    if (junctionEnd !== -1) end = junctionEnd;
-
-    segments.push({
-      start_idx: start,
-      end_idx: end,
-      waypoints: pts.slice(start, end + 1).map(p => ({ lat: p.lat, lon: p.lon })),
-    });
-    start = end; // overlap by 1 — same point starts next segment
+// Sample N evenly-spaced shaping points from pts[startIdx..endIdx] exclusive of endpoints
+function shapingPoints(pts, startIdx, endIdx, n = 3) {
+  const count = endIdx - startIdx - 1;
+  if (count <= 0) return [];
+  const step = Math.max(1, Math.floor(count / (n + 1)));
+  const result = [];
+  for (let k = startIdx + step; k < endIdx && result.length < n; k += step) {
+    result.push({ lat: pts[k].lat, lon: pts[k].lon });
   }
-  return segments;
+  return result;
 }
 
-async function orsRoute(profile, waypoints) {
-  const coords = waypoints.map(w => [w.lon, w.lat]);
+// Sample dense waypoints for pass-2 gap fill (every Nth point)
+function denseWaypoints(pts, startIdx, endIdx, maxWpts = 20) {
+  const count = endIdx - startIdx + 1;
+  const step  = Math.max(1, Math.floor(count / maxWpts));
+  const wpts  = [];
+  for (let k = startIdx; k <= endIdx; k += step) wpts.push({ lat: pts[k].lat, lon: pts[k].lon });
+  if (wpts[wpts.length - 1].lat !== pts[endIdx].lat) wpts.push({ lat: pts[endIdx].lat, lon: pts[endIdx].lon });
+  return wpts;
+}
+
+// --- ORS call with retry on 429 ---
+async function orsRoute(profile, waypoints, attempt = 0) {
   const body = {
-    coordinates: coords,
+    coordinates: waypoints.map(w => [w.lon, w.lat]),
     instructions: false,
     geometry_simplify: false,
     preference: "recommended",
   };
   const res = await fetch(`https://api.openrouteservice.org/v2/directions/${profile}/geojson`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": ORS_API_KEY,
-    },
+    headers: { "Content-Type": "application/json", "Authorization": ORS_API_KEY },
     body: JSON.stringify(body),
   });
+
+  if (res.status === 429) {
+    if (attempt >= 3) throw new Error(`ORS rate limited`);
+    const wait = 2000 * Math.pow(2, attempt);
+    setStatus("working", `Rate limit — waiting ${wait/1000}s…`);
+    await sleep(wait);
+    return orsRoute(profile, waypoints, attempt + 1);
+  }
   if (!res.ok) throw new Error(`ORS ${profile} HTTP ${res.status}`);
-  const data = await res.json();
-  const coords2 = data.features?.[0]?.geometry?.coordinates;
-  if (!coords2) throw new Error("No geometry from ORS");
-  return coords2.map(c => ({ lat: c[1], lon: c[0] }));
+  const data   = await res.json();
+  const coords = data.features?.[0]?.geometry?.coordinates;
+  if (!coords) throw new Error("No geometry from ORS");
+  return coords.map(c => ({ lat: c[1], lon: c[0] }));
 }
 
-async function snapSegmentWithFallback(waypoints) {
+async function snapWithFallback(waypoints) {
   for (const profile of ORS_PROFILES) {
-    try {
-      return await orsRoute(profile, waypoints);
-    } catch (e) {
-      // try next profile
-    }
+    try { return await orsRoute(profile, waypoints); } catch (e) { /* next */ }
   }
   return null;
 }
 
-function maxDeviationFromOriginal(snappedPts, originalWpts) {
-  let maxDev = 0;
+function maxDeviation(snappedPts, origPts) {
+  let max = 0;
   for (const sp of snappedPts) {
-    const minD = Math.min(...originalWpts.map(op => haversine(sp.lat, sp.lon, op.lat, op.lon)));
-    if (minD > maxDev) maxDev = minD;
+    const min = Math.min(...origPts.map(op => haversine(sp.lat, sp.lon, op.lat, op.lon)));
+    if (min > max) max = min;
   }
-  return maxDev;
+  return max;
 }
 
-// Pin the first and last point of a snapped result to exactly match
-// the original boundary coordinates, eliminating junction kinks.
-function pinBoundaries(snapped, startPt, endPt) {
-  if (!snapped || snapped.length === 0) return snapped;
-  return [
-    { lat: startPt.lat, lon: startPt.lon },
-    ...snapped.slice(1, -1),
-    { lat: endPt.lat, lon: endPt.lon },
-  ];
+function pinBoundaries(snapped, start, end) {
+  if (!snapped?.length) return snapped;
+  return [{ lat: start.lat, lon: start.lon }, ...snapped.slice(1, -1), { lat: end.lat, lon: end.lon }];
 }
 
+// Attempt to snap between two junction indices; returns snapped [{lat,lon}] or null
+async function snapJunctionSegment(pts, startIdx, endIdx, shapingN = 3) {
+  const start  = { lat: pts[startIdx].lat, lon: pts[startIdx].lon };
+  const end    = { lat: pts[endIdx].lat,   lon: pts[endIdx].lon   };
+  const middle = shapingPoints(pts, startIdx, endIdx, shapingN);
+  const wpts   = [start, ...middle, end];
+
+  const origSlice = pts.slice(startIdx, endIdx + 1);
+  const snapped   = await snapWithFallback(wpts);
+  if (!snapped) return null;
+
+  const pinned = pinBoundaries(snapped, start, end);
+  const dev    = maxDeviation(pinned, origSlice);
+  return dev <= DEVIATION_LIMIT ? pinned : null;
+}
+
+// --- Main two-pass snapping ---
 async function snapAllSegments(origPts) {
-  const segments = buildSegments(origPts);
-  document.getElementById("s-segs").textContent = segments.length;
+  // ── PASS 1: junction-to-junction ──────────────────────────
+  const junctions = detectJunctions(origPts);
+  const p1Total   = junctions.length - 1;
+  document.getElementById("s-segs").textContent = `${p1Total} (pass 1)`;
 
-  const snappedResults = {};
+  // segResults[i] = { startIdx, endIdx, snapped: [{lat,lon}]|null }
+  const segResults = [];
 
-  for (let i = 0; i < segments.length; i++) {
-    const seg  = segments[i];
-    const wpts = seg.waypoints;
-
+  for (let i = 0; i < p1Total; i++) {
     if (i > 0) await sleep(ORS_SLEEP_MS);
 
-    let snapped = null;
-    if (wpts.length >= 2) {
-      snapped = await snapSegmentWithFallback(wpts);
-      if (snapped) {
-        snapped = pinBoundaries(snapped, wpts[0], wpts[wpts.length - 1]);
-        const dev = maxDeviationFromOriginal(snapped, wpts);
-        if (dev > DEVIATION_LIMIT) snapped = null;
-      }
-    }
-    snappedResults[i] = snapped;
-
-    const pct = 15 + Math.round(80 * (i + 1) / segments.length);
+    const startIdx = junctions[i];
+    const endIdx   = junctions[i + 1];
+    const pct      = Math.round(5 + 45 * (i + 1) / p1Total);
     setProgress(pct);
-    setStatus("working", `Snapping segment ${i+1} / ${segments.length}…`);
+    setStatus("working", `Pass 1 — segment ${i+1} / ${p1Total}`);
+
+    const snapped = await snapJunctionSegment(origPts, startIdx, endIdx, 3);
+    segResults.push({ startIdx, endIdx, snapped });
   }
 
+  // ── PASS 2: gap fill on rejected segments ─────────────────
+  const failedSegs = segResults.filter(s => s.snapped === null);
+  const p2Total    = failedSegs.length;
+  document.getElementById("s-segs").textContent = `${p1Total} + ${p2Total} gaps`;
+
+  for (let i = 0; i < p2Total; i++) {
+    if (i > 0 || p1Total > 0) await sleep(ORS_SLEEP_MS);
+
+    const seg  = failedSegs[i];
+    const pct  = Math.round(52 + 40 * (i + 1) / Math.max(p2Total, 1));
+    setProgress(pct);
+    setStatus("working", `Pass 2 — gap ${i+1} / ${p2Total}`);
+
+    // Try with more shaping points first, then dense waypoints
+    let snapped = await snapJunctionSegment(origPts, seg.startIdx, seg.endIdx, 8);
+    if (!snapped) {
+      // Dense fallback: subsample original points
+      const wpts    = denseWaypoints(origPts, seg.startIdx, seg.endIdx, 20);
+      const origSl  = origPts.slice(seg.startIdx, seg.endIdx + 1);
+      const raw     = await snapWithFallback(wpts);
+      if (raw) {
+        const pinned = pinBoundaries(raw,
+          { lat: origPts[seg.startIdx].lat, lon: origPts[seg.startIdx].lon },
+          { lat: origPts[seg.endIdx].lat,   lon: origPts[seg.endIdx].lon   });
+        if (maxDeviation(pinned, origSl) <= DEVIATION_LIMIT) snapped = pinned;
+      }
+    }
+    seg.snapped = snapped; // update in place (segResults still holds reference)
+  }
+
+  // ── Build payload for backend ─────────────────────────────
+  setStatus("working", "Finalising…");
+  setProgress(97);
+
   const payload = {
-    segments: segments.map((s, i) => ({
-      start_idx: s.start_idx,
-      end_idx:   s.end_idx,
-      result:    snappedResults[i],
+    segments: segResults.map(s => ({
+      start_idx: s.startIdx,
+      end_idx:   s.endIdx,
+      result:    s.snapped,
     })),
   };
 
-  setStatus("working", "Finalising route…");
-  setProgress(97);
   await fetch(`${BACKEND_URL}/submit_snapped/${jobId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

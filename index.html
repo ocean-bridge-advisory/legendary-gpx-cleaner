@@ -326,6 +326,7 @@ let elapsedTimer = null;
 let elapsedSec   = 0;
 let startedAt    = null;
 let fileBlob     = null;
+let snapping     = false;  // guard: prevent double-trigger of snapAllSegments
 
 // ============================================================
 // DRAG & DROP
@@ -473,14 +474,14 @@ async function handleStatus(data) {
     setProgress(10);
 
   } else if (data.status === "waiting_for_snapping") {
+    if (snapping) return;
+    snapping = true;
     clearInterval(pollTimer);
     pollTimer = null;
-    const segs = data.segments || [];
-    document.getElementById("s-segs").textContent = segs.length;
-    document.getElementById("total_distance_m") && (document.getElementById("total_distance_m").textContent = fmtDist(data.total_distance_m||0));
-    setStatus("working", `Snapping ${segs.length} segments via ORS…`);
+    const origPts = data.original_points || [];
+    setStatus("working", `Building segments…`);
     setProgress(15);
-    await snapAllSegments(segs, data.total_segments || segs.length);
+    await snapAllSegments(origPts);
 
   } else if (data.status === "done") {
     clearInterval(pollTimer);
@@ -608,14 +609,8 @@ function pinBoundaries(snapped, startPt, endPt) {
   ];
 }
 
-async function snapAllSegments(serverSegments, totalSegs) {
-  // Re-segment client-side with junction awareness using the original points
-  // (server segments are the fallback structure; we override with junction-aware ones)
-  const allOrigPts = serverSegments.flatMap((seg, i) =>
-    i === 0 ? seg.waypoints : seg.waypoints.slice(1)
-  );
-  const segments = buildSegments(allOrigPts);
-
+async function snapAllSegments(origPts) {
+  const segments = buildSegments(origPts);
   document.getElementById("s-segs").textContent = segments.length;
 
   const snappedResults = {};
@@ -630,7 +625,6 @@ async function snapAllSegments(serverSegments, totalSegs) {
     if (wpts.length >= 2) {
       snapped = await snapSegmentWithFallback(wpts);
       if (snapped) {
-        // Pin boundaries to exact original start/end → eliminates kinks
         snapped = pinBoundaries(snapped, wpts[0], wpts[wpts.length - 1]);
         const dev = maxDeviationFromOriginal(snapped, wpts);
         if (dev > DEVIATION_LIMIT) snapped = null;
@@ -643,9 +637,7 @@ async function snapAllSegments(serverSegments, totalSegs) {
     setStatus("working", `Snapping segment ${i+1} / ${segments.length}…`);
   }
 
-  // Rebuild snapped_segments keyed by index, with start/end idx for backend merge
   const payload = {
-    snapped_segments: snappedResults,
     segments: segments.map((s, i) => ({
       start_idx: s.start_idx,
       end_idx:   s.end_idx,
@@ -760,6 +752,7 @@ function setProgress(pct) {
 }
 
 function showError(msg) {
+  snapping = false;
   const box = document.getElementById("error-box");
   box.textContent = "Error: " + msg;
   show("error-box");
@@ -787,7 +780,8 @@ function stopElapsed() {
 function resetAll(full = true) {
   clearInterval(pollTimer);
   clearInterval(elapsedTimer);
-  jobId = null;
+  jobId    = null;
+  snapping = false;
   if (originalLayer)   { map.removeLayer(originalLayer);   originalLayer   = null; }
   if (snappedLayer)    { map.removeLayer(snappedLayer);    snappedLayer    = null; }
   if (unsnappedLayer)  { map.removeLayer(unsnappedLayer);  unsnappedLayer  = null; }

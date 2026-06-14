@@ -112,8 +112,7 @@ def build_gpx(original_gpx, result_points):
 # Background processing worker
 # ---------------------------------------------------------------------------
 
-SEGMENT_SIZE = 25          # ORS waypoints per request
-DEVIATION_THRESHOLD = 10   # metres
+DEVIATION_THRESHOLD = 25   # metres — matches frontend
 
 
 def process_job(job_id, gpx_bytes):
@@ -130,39 +129,22 @@ def process_job(job_id, gpx_bytes):
         job["total_points"] = len(original_points)
         job["original_points"] = [{"lat": p["lat"], "lon": p["lon"]} for p in original_points]
 
-        # Calculate total distance for summary
         orig_coords = [(p["lat"], p["lon"]) for p in original_points]
         job["total_distance_m"] = total_distance_m(orig_coords)
 
-        # Split into segments (overlapping by 1 point for continuity)
-        segments = []
-        i = 0
-        while i < len(original_points) - 1:
-            end = min(i + SEGMENT_SIZE - 1, len(original_points) - 1)
-            segments.append((i, end))
-            i = end  # overlap by 1
-
-        job["total_segments"] = len(segments)
+        # Segmentation is done entirely client-side (junction-aware).
+        # Backend just exposes the raw points and waits for the frontend to POST results.
+        job["total_segments"] = None
         job["processed_segments"] = 0
-        job["status"] = "routing"
-
-        # Each segment is processed by the frontend's ORS fetch.
-        # The backend just stores the plan; the frontend will POST snapped results back.
-        job["segments"] = [
-            {
-                "start_idx": s[0],
-                "end_idx": s[1],
-                "waypoints": [
-                    {"lat": original_points[k]["lat"], "lon": original_points[k]["lon"]}
-                    for k in range(s[0], s[1] + 1)
-                ],
-            }
-            for s in segments
-        ]
-
+        job["segments"] = []   # empty — frontend rebuilds from original_points
         job["status"] = "waiting_for_snapping"
-        job["snapped_segments"] = {}   # keyed by segment index
+        job["client_segments"] = None
         job["original_points_data"] = original_points
+        job["gpx_obj"] = gpx_obj
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
         job["gpx_obj"] = gpx_obj
 
     except Exception as e:
@@ -297,7 +279,6 @@ def status(job_id):
     }
 
     if job["status"] == "waiting_for_snapping":
-        resp["segments"] = job.get("segments", [])
         resp["original_points"] = job.get("original_points", [])
         resp["total_distance_m"] = job.get("total_distance_m")
 

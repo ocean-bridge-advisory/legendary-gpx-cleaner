@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPX Road Snapper</title>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #f7f8fa;
+    --surface:   #ffffff;
+    --border:    #e2e5ea;
+    --text:      #1a1d23;
+    --muted:     #6b7280;
+    --accent:    #2563eb;
+    --green:     #16a34a;
+    --orange:    #ea580c;
+    --blue:      #2563eb;
+    --radius:    10px;
+    --shadow:    0 1px 4px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.06);
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header svg { flex-shrink: 0; }
+  header h1 { font-size: 1.05rem; font-weight: 600; letter-spacing: -.01em; }
+  header p  { font-size: .78rem; color: var(--muted); margin-top: 1px; }
+
+  /* ── Main layout ── */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    grid-template-rows: 1fr;
+    gap: 0;
+    min-height: 0;
+    height: calc(100vh - 57px);
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 20px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* ── Drop zone ── */
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 32px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    background: var(--bg);
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--accent);
+    background: #eff6ff;
+  }
+  .dropzone svg { margin-bottom: 10px; opacity: .45; }
+  .dropzone .dz-label { font-size: .88rem; font-weight: 500; color: var(--text); }
+  .dropzone .dz-sub   { font-size: .75rem; color: var(--muted); margin-top: 4px; }
+  #file-input { display: none; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .card-title {
+    font-size: .72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+
+  /* ── Stat grid ── */
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; }
+  .stat-val { font-size: 1.15rem; font-weight: 700; letter-spacing: -.02em; }
+  .stat-lbl { font-size: .7rem; color: var(--muted); margin-top: 2px; }
+
+  /* ── Progress ── */
+  .progress-bar-wrap {
+    background: var(--border);
+    border-radius: 99px;
+    height: 6px;
+    overflow: hidden;
+    margin: 8px 0;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    border-radius: 99px;
+    background: var(--accent);
+    transition: width .3s;
+    width: 0%;
+  }
+  .progress-label { font-size: .75rem; color: var(--muted); }
+
+  /* ── Status pill ── */
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .75rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 99px;
+    background: #f3f4f6;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .status-pill.working { background: #eff6ff; color: var(--accent); border-color: #bfdbfe; }
+  .status-pill.done    { background: #f0fdf4; color: var(--green);  border-color: #bbf7d0; }
+  .status-pill.error   { background: #fef2f2; color: #dc2626;       border-color: #fecaca; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .dot.pulse { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  /* ── Legend ── */
+  .legend { display: flex; flex-direction: column; gap: 7px; }
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: .8rem; }
+  .swatch { width: 20px; height: 4px; border-radius: 2px; flex-shrink: 0; }
+  .swatch.blue   { background: #3b82f6; }
+  .swatch.green  { background: #16a34a; }
+  .swatch.orange { background: #ea580c; }
+
+  /* ── Button ── */
+  .btn {
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 7px;
+    font-size: .85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s, transform .1s;
+  }
+  .btn:active { transform: scale(.98); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { opacity: .9; }
+  .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--bg); }
+
+  /* ── Error message ── */
+  .error-box {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 7px;
+    padding: 12px 14px;
+    font-size: .8rem;
+    color: #dc2626;
+    line-height: 1.5;
+  }
+
+  /* ── Map ── */
+  #map {
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    background: #e8ecef;
+  }
+
+  /* ── Elapsed timer ── */
+  #elapsed-wrap {
+    font-size: .78rem;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  /* hidden */
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+    <rect width="28" height="28" rx="7" fill="#2563eb"/>
+    <path d="M7 20 Q10 8 14 14 Q18 20 21 8" stroke="white" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+  </svg>
+  <div>
+    <h1>GPX Road Snapper</h1>
+    <p>Snaps GPS tracks to the road network via OpenRouteService</p>
+  </div>
+</header>
+
+<main>
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+
+    <!-- Drop zone -->
+    <div class="dropzone" id="dropzone">
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#6b7280" stroke-width="1.5">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <div class="dz-label">Drop .GPX file here</div>
+      <div class="dz-sub">or click to browse</div>
+      <input type="file" id="file-input" accept=".gpx">
+    </div>
+
+    <!-- File summary -->
+    <div class="card hidden" id="file-summary">
+      <div class="card-title">File</div>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-val" id="s-points">—</div><div class="stat-lbl">Trackpoints</div></div>
+        <div class="stat"><div class="stat-val" id="s-dist">—</div><div class="stat-lbl">Distance</div></div>
+        <div class="stat"><div class="stat-val" id="s-dur">—</div><div class="stat-lbl">Duration</div></div>
+        <div class="stat"><div class="stat-val" id="s-segs">—</div><div class="stat-lbl">Segments</div></div>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card hidden" id="status-card">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        Status <span class="status-pill" id="status-pill"><span class="dot pulse"></span><span id="status-text">Idle</span></span>
+      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progress-fill"></div></div>
+      <div class="progress-label" id="progress-label">—</div>
+      <div style="margin-top:8px" id="elapsed-wrap" class="hidden">⏱ <span id="elapsed">0</span>s elapsed</div>
+    </div>
+
+    <!-- Error -->
+    <div class="error-box hidden" id="error-box"></div>
+
+    <!-- Results summary -->
+    <div class="card hidden" id="results-card">
+      <div class="card-title">Results</div>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-val" id="r-snapped">—</div><div class="stat-lbl">Snapped</div></div>
+        <div class="stat"><div class="stat-val" id="r-unsnapped">—</div><div class="stat-lbl">Original kept</div></div>
+        <div class="stat"><div class="stat-val" id="r-dist">—</div><div class="stat-lbl">Result dist.</div></div>
+        <div class="stat"><div class="stat-val" id="r-orig-dist">—</div><div class="stat-lbl">Original dist.</div></div>
+      </div>
+    </div>
+
+    <!-- Legend -->
+    <div class="card hidden" id="legend-card">
+      <div class="card-title">Map legend</div>
+      <div class="legend">
+        <div class="legend-row"><span class="swatch blue"></span>Original track</div>
+        <div class="legend-row"><span class="swatch green"></span>Snapped to road</div>
+        <div class="legend-row"><span class="swatch orange"></span>Original kept (deviation &gt;10 m)</div>
+      </div>
+    </div>
+
+    <!-- Download -->
+    <button class="btn btn-primary hidden" id="download-btn">⬇ Download corrected GPX</button>
+
+    <!-- Reset -->
+    <button class="btn btn-secondary hidden" id="reset-btn">Upload another file</button>
+
+  </aside>
+
+  <!-- MAP -->
+  <div id="map"></div>
+</main>
+
+<script>
+// ============================================================
+// CONFIG  ← replace BACKEND_URL after Render deploy
+// ============================================================
+const BACKEND_URL = "https://YOUR_RENDER_APP.onrender.com";
+const ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjBjMWIwN2VjMzg5MjRiM2U4ZGJjNjc0ODUxZGM5YTRlIiwiaCI6Im11cm11cjY0In0=";
+const POLL_INTERVAL_MS = 2000;
+const POLL_TIMEOUT_MS  = 300_000; // 5 min
+const ORS_PROFILES     = ["driving-car", "cycling-road", "cycling-mountain"];
+const DEVIATION_LIMIT  = 10; // metres
+
+// ============================================================
+// MAP INIT
+// ============================================================
+const map = L.map("map").setView([20, 0], 2);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "© OpenStreetMap contributors",
+  maxZoom: 19,
+}).addTo(map);
+
+let originalLayer = null;
+let snappedLayer  = null;
+let unsnappedLayer = null;
+
+// ============================================================
+// STATE
+// ============================================================
+let jobId        = null;
+let pollTimer    = null;
+let elapsedTimer = null;
+let elapsedSec   = 0;
+let startedAt    = null;
+let fileBlob     = null;
+
+// ============================================================
+// DRAG & DROP
+// ============================================================
+const dropzone  = document.getElementById("dropzone");
+const fileInput = document.getElementById("file-input");
+
+dropzone.addEventListener("click", () => fileInput.click());
+dropzone.addEventListener("dragover",  e => { e.preventDefault(); dropzone.classList.add("dragover"); });
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  dropzone.classList.remove("dragover");
+  const file = e.dataTransfer.files[0];
+  if (file) handleFile(file);
+});
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) handleFile(fileInput.files[0]);
+});
+
+document.getElementById("reset-btn").addEventListener("click", resetAll);
+document.getElementById("download-btn").addEventListener("click", downloadResult);
+
+// ============================================================
+// HAVERSINE
+// ============================================================
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6_371_000;
+  const phi1 = lat1 * Math.PI / 180, phi2 = lat2 * Math.PI / 180;
+  const dphi = (lat2 - lat1) * Math.PI / 180;
+  const dlam = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dphi/2)**2 + Math.cos(phi1)*Math.cos(phi2)*Math.sin(dlam/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function totalDist(pts) { // pts: [{lat,lon}]
+  let d = 0;
+  for (let i = 1; i < pts.length; i++)
+    d += haversine(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+  return d;
+}
+
+function fmtDist(m) {
+  return m >= 1000 ? (m/1000).toFixed(2)+" km" : Math.round(m)+" m";
+}
+
+// ============================================================
+// FILE HANDLING
+// ============================================================
+async function handleFile(file) {
+  resetAll(false);
+  fileBlob = file;
+
+  // Quick client-side parse for preview
+  const text = await file.text();
+  const parser = new DOMParser();
+  const doc    = parser.parseFromString(text, "application/xml");
+  const trkpts = doc.querySelectorAll("trkpt");
+
+  if (!trkpts.length) { showError("No trackpoints found in this GPX file."); return; }
+
+  const pts = Array.from(trkpts).map(t => ({
+    lat: parseFloat(t.getAttribute("lat")),
+    lon: parseFloat(t.getAttribute("lon")),
+    time: t.querySelector("time")?.textContent,
+  }));
+
+  // Duration
+  let dur = "—";
+  if (pts[0].time && pts[pts.length-1].time) {
+    const s = new Date(pts[0].time), e = new Date(pts[pts.length-1].time);
+    const diff = (e - s) / 1000;
+    const h = Math.floor(diff / 3600), m = Math.floor((diff % 3600) / 60), s2 = Math.floor(diff % 60);
+    dur = h > 0 ? `${h}h ${m}m` : `${m}m ${s2}s`;
+  }
+
+  document.getElementById("s-points").textContent = pts.length.toLocaleString();
+  document.getElementById("s-dist").textContent   = fmtDist(totalDist(pts));
+  document.getElementById("s-dur").textContent    = dur;
+
+  show("file-summary");
+
+  // Draw original track on map
+  drawOriginal(pts);
+
+  // Upload to backend
+  uploadFile(file);
+}
+
+function drawOriginal(pts) {
+  if (originalLayer) map.removeLayer(originalLayer);
+  const latlngs = pts.map(p => [p.lat, p.lon]);
+  originalLayer = L.polyline(latlngs, { color: "#3b82f6", weight: 3, opacity: .65 }).addTo(map);
+  map.fitBounds(originalLayer.getBounds(), { padding: [20, 20] });
+}
+
+// ============================================================
+// UPLOAD
+// ============================================================
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+
+  setStatus("working", "Uploading…");
+  show("status-card");
+
+  try {
+    const res  = await fetch(`${BACKEND_URL}/upload`, { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok || !data.job_id) throw new Error(data.error || "Upload failed");
+    jobId = data.job_id;
+    startElapsed();
+    startPolling();
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+// ============================================================
+// POLLING
+// ============================================================
+function startPolling() {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  pollTimer = setInterval(async () => {
+    if (Date.now() > deadline) {
+      clearInterval(pollTimer);
+      showError("Timed out waiting for backend after 5 minutes.");
+      return;
+    }
+    try {
+      const res  = await fetch(`${BACKEND_URL}/status/${jobId}`);
+      const data = await res.json();
+      handleStatus(data);
+    } catch (e) { /* network blip, retry */ }
+  }, POLL_INTERVAL_MS);
+}
+
+async function handleStatus(data) {
+  if (data.status === "queued" || data.status === "parsing") {
+    setStatus("working", "Parsing GPX…");
+    setProgress(5);
+
+  } else if (data.status === "routing") {
+    setStatus("working", "Building segments…");
+    setProgress(10);
+
+  } else if (data.status === "waiting_for_snapping") {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    const segs = data.segments || [];
+    document.getElementById("s-segs").textContent = segs.length;
+    document.getElementById("total_distance_m") && (document.getElementById("total_distance_m").textContent = fmtDist(data.total_distance_m||0));
+    setStatus("working", `Snapping ${segs.length} segments via ORS…`);
+    setProgress(15);
+    await snapAllSegments(segs, data.total_segments || segs.length);
+
+  } else if (data.status === "done") {
+    clearInterval(pollTimer);
+    stopElapsed();
+    renderResults(data);
+
+  } else if (data.status === "error") {
+    clearInterval(pollTimer);
+    stopElapsed();
+    showError(data.error || "Processing failed.");
+  }
+}
+
+// ============================================================
+// ORS SNAPPING (frontend)
+// ============================================================
+async function orsRoute(profile, waypoints) {
+  // waypoints: [{lat,lon}]
+  const coords = waypoints.map(w => [w.lon, w.lat]);
+  const body = {
+    coordinates: coords,
+    instructions: false,
+    geometry_simplify: false,
+    preference: "recommended",
+  };
+  const res = await fetch(`https://api.openrouteservice.org/v2/directions/${profile}/geojson`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": ORS_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`ORS ${profile} HTTP ${res.status}`);
+  const data = await res.json();
+  const coords2 = data.features?.[0]?.geometry?.coordinates;
+  if (!coords2) throw new Error("No geometry from ORS");
+  return coords2.map(c => ({ lat: c[1], lon: c[0] }));
+}
+
+async function snapSegmentWithFallback(waypoints) {
+  for (const profile of ORS_PROFILES) {
+    try {
+      const routed = await orsRoute(profile, waypoints);
+      return routed;
+    } catch (e) {
+      // try next profile
+    }
+  }
+  return null; // all profiles failed → keep original
+}
+
+function maxDeviationFromOriginal(snappedPts, originalWpts) {
+  let maxDev = 0;
+  for (const sp of snappedPts) {
+    const minD = Math.min(...originalWpts.map(op => haversine(sp.lat, sp.lon, op.lat, op.lon)));
+    if (minD > maxDev) maxDev = minD;
+  }
+  return maxDev;
+}
+
+async function snapAllSegments(segments, totalSegs) {
+  const snappedResults = {}; // index -> [{lat,lon}] or null
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const wpts = seg.waypoints;
+
+    // Throttle: avoid hammering ORS
+    if (i > 0) await sleep(300);
+
+    let snapped = null;
+    if (wpts.length >= 2) {
+      snapped = await snapSegmentWithFallback(wpts);
+      // Validate deviation
+      if (snapped) {
+        const dev = maxDeviationFromOriginal(snapped, wpts);
+        if (dev > DEVIATION_LIMIT) snapped = null;
+      }
+    }
+    snappedResults[i] = snapped;
+
+    const pct = 15 + Math.round(80 * (i + 1) / segments.length);
+    setProgress(pct);
+    setStatus("working", `Snapping segment ${i+1} / ${segments.length}…`);
+  }
+
+  // POST results to backend
+  setStatus("working", "Finalising route…");
+  setProgress(97);
+  await fetch(`${BACKEND_URL}/submit_snapped/${jobId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ snapped_segments: snappedResults }),
+  });
+
+  // Resume polling for "done"
+  startPolling();
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ============================================================
+// RENDER RESULTS
+// ============================================================
+function renderResults(data) {
+  setStatus("done", "Complete");
+  setProgress(100);
+
+  const origPts   = data.original_points || [];
+  const resultPts = data.result_points   || [];
+  const segMap    = data.segment_map     || [];
+  const summary   = data.summary         || {};
+
+  // Redraw original (lighter)
+  if (originalLayer) map.removeLayer(originalLayer);
+  originalLayer = L.polyline(origPts.map(p => [p.lat, p.lon]), { color: "#3b82f6", weight: 2, opacity: .4, dashArray: "5,5" }).addTo(map);
+
+  // Build snapped / unsnapped polylines
+  let greenSegs = [], orangeSegs = [];
+  let curSeg = [], curTag = null;
+
+  for (let i = 0; i < resultPts.length; i++) {
+    const tag = segMap[i] || "original";
+    if (tag !== curTag) {
+      if (curSeg.length > 1) {
+        if (curTag === "snapped") greenSegs.push([...curSeg]);
+        else orangeSegs.push([...curSeg]);
+      }
+      // carry last point for continuity
+      curSeg = i > 0 ? [[resultPts[i-1].lat, resultPts[i-1].lon]] : [];
+      curTag = tag;
+    }
+    curSeg.push([resultPts[i].lat, resultPts[i].lon]);
+  }
+  if (curSeg.length > 1) {
+    if (curTag === "snapped") greenSegs.push(curSeg);
+    else orangeSegs.push(curSeg);
+  }
+
+  if (snappedLayer)   map.removeLayer(snappedLayer);
+  if (unsnappedLayer) map.removeLayer(unsnappedLayer);
+  snappedLayer   = L.polyline(greenSegs,  { color: "#16a34a", weight: 4, opacity: .9 }).addTo(map);
+  unsnappedLayer = L.polyline(orangeSegs, { color: "#ea580c", weight: 4, opacity: .9 }).addTo(map);
+
+  const allBounds = [...origPts, ...resultPts].map(p => [p.lat, p.lon]);
+  if (allBounds.length) map.fitBounds(L.latLngBounds(allBounds), { padding: [20, 20] });
+
+  // Summary stats
+  document.getElementById("r-snapped").textContent    = `${summary.snapped_pct ?? 0}%`;
+  document.getElementById("r-unsnapped").textContent  = `${summary.unsnapped_pct ?? 0}%`;
+  document.getElementById("r-dist").textContent       = fmtDist(summary.total_distance_m || 0);
+  document.getElementById("r-orig-dist").textContent  = fmtDist(summary.original_distance_m || 0);
+
+  show("results-card");
+  show("legend-card");
+  show("download-btn");
+  show("reset-btn");
+}
+
+// ============================================================
+// DOWNLOAD
+// ============================================================
+async function downloadResult() {
+  if (!jobId) return;
+  try {
+    const res  = await fetch(`${BACKEND_URL}/download/${jobId}`);
+    if (!res.ok) throw new Error("Download failed");
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = "snapped.gpx";
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    showError("Download failed: " + e.message);
+  }
+}
+
+// ============================================================
+// UI HELPERS
+// ============================================================
+function setStatus(type, text) {
+  const pill = document.getElementById("status-pill");
+  const span = document.getElementById("status-text");
+  pill.className = `status-pill ${type}`;
+  span.textContent = text;
+}
+
+function setProgress(pct) {
+  document.getElementById("progress-fill").style.width = pct + "%";
+  document.getElementById("progress-label").textContent = `${pct}%`;
+}
+
+function showError(msg) {
+  const box = document.getElementById("error-box");
+  box.textContent = "Error: " + msg;
+  show("error-box");
+  setStatus("error", "Failed");
+  stopElapsed();
+}
+
+function show(id) { document.getElementById(id).classList.remove("hidden"); }
+function hide(id) { document.getElementById(id).classList.add("hidden"); }
+
+function startElapsed() {
+  elapsedSec = 0;
+  startedAt  = Date.now();
+  show("elapsed-wrap");
+  elapsedTimer = setInterval(() => {
+    elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+    document.getElementById("elapsed").textContent = elapsedSec;
+  }, 1000);
+}
+
+function stopElapsed() {
+  clearInterval(elapsedTimer);
+}
+
+function resetAll(full = true) {
+  clearInterval(pollTimer);
+  clearInterval(elapsedTimer);
+  jobId = null;
+  if (originalLayer)   { map.removeLayer(originalLayer);   originalLayer   = null; }
+  if (snappedLayer)    { map.removeLayer(snappedLayer);    snappedLayer    = null; }
+  if (unsnappedLayer)  { map.removeLayer(unsnappedLayer);  unsnappedLayer  = null; }
+
+  hide("file-summary");
+  hide("status-card");
+  hide("results-card");
+  hide("legend-card");
+  hide("download-btn");
+  hide("reset-btn");
+  hide("error-box");
+  hide("elapsed-wrap");
+
+  document.getElementById("progress-fill").style.width = "0%";
+  fileInput.value = "";
+
+  if (full) map.setView([20, 0], 2);
+}
+</script>
+</body>
+</html>

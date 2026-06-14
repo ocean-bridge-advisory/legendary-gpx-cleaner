@@ -29,7 +29,8 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     background: var(--bg);
     color: var(--text);
-    min-height: 100vh;
+    height: 100vh;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }
@@ -70,9 +71,9 @@
   #elev-panel {
     background: var(--surface);
     border-top: 1px solid var(--border);
-    padding: 10px 16px 12px;
+    padding: 8px 16px 10px;
     flex-shrink: 0;
-    height: 180px;
+    height: 150px;
     position: relative;
   }
   #elev-panel.hidden { display: none !important; }
@@ -80,17 +81,44 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 6px;
+    margin-bottom: 4px;
   }
   .elev-title { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
   .elev-info  { font-size: .75rem; color: var(--muted); }
-  #elev-canvas { width: 100%; height: 110px; display: block; cursor: crosshair; }
+  #elev-canvas { width: 100%; height: 90px; display: block; cursor: crosshair; }
+  .elev-fix-btn {
+    font-size: .72rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity .15s;
+  }
+  .elev-fix-btn:hover { opacity: .9; }
+  .elev-fix-btn:disabled { opacity: .5; cursor: default; }
+  .elev-fix-btn.done { background: var(--surface); color: var(--green); border-color: var(--green); }
   #elev-slider-wrap { margin-top: 4px; }
   #elev-slider {
     width: 100%;
     accent-color: var(--accent);
     cursor: pointer;
   }
+  .btn-abort {
+    font-size: .72rem;
+    font-weight: 600;
+    padding: 3px 12px;
+    border: 1px solid #fecaca;
+    border-radius: 6px;
+    background: #fef2f2;
+    color: #dc2626;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-abort:hover { background: #fee2e2; }
   /* Cursor marker on map */
   .cursor-marker {
     width: 12px; height: 12px;
@@ -196,6 +224,7 @@
   .swatch.blue   { background: #3b82f6; }
   .swatch.green  { background: #16a34a; }
   .swatch.orange { background: #ea580c; }
+  .swatch.violet { background: #7c3aed; }
 
   /* ── Button ── */
   .btn {
@@ -226,6 +255,11 @@
     line-height: 1.5;
   }
 
+  .error-box.warn {
+    background: #fffbeb;
+    border-color: #fde68a;
+    color: #b45309;
+  }
   /* ── Map ── */
   #map {
     width: 100%;
@@ -292,7 +326,10 @@
       </div>
       <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progress-fill"></div></div>
       <div class="progress-label" id="progress-label">—</div>
-      <div style="margin-top:8px" id="elapsed-wrap" class="hidden">⏱ <span id="elapsed">0</span>s elapsed</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
+        <div id="elapsed-wrap" class="hidden">⏱ <span id="elapsed">0</span>s elapsed</div>
+        <button id="abort-btn" class="btn-abort hidden">Abort</button>
+      </div>
     </div>
 
     <!-- Error -->
@@ -316,8 +353,12 @@
         <div class="legend-row"><span class="swatch blue"></span>Original track</div>
         <div class="legend-row"><span class="swatch green"></span>Snapped to road</div>
         <div class="legend-row"><span class="swatch orange"></span>Original kept (deviation &gt;25 m)</div>
+        <div class="legend-row"><span class="swatch violet"></span>Spliced gap (routed across dropout)</div>
       </div>
     </div>
+
+    <!-- Warning -->
+    <div class="error-box warn hidden" id="warn-box"></div>
 
     <!-- Download -->
     <button class="btn btn-primary hidden" id="download-btn">⬇ Download corrected GPX</button>
@@ -335,7 +376,11 @@
     <div id="elev-panel" class="hidden">
       <div class="elev-header">
         <span class="elev-title">Elevation</span>
-        <span class="elev-info" id="elev-info">—</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="elev-info" id="elev-info">—</span>
+          <button id="splice-btn" class="elev-fix-btn hidden" style="background:#7c3aed;border-color:#7c3aed">Splice gaps</button>
+          <button id="fix-elev-btn" class="elev-fix-btn hidden">Fix elevation (pass 3)</button>
+        </div>
       </div>
       <canvas id="elev-canvas"></canvas>
       <div id="elev-slider-wrap">
@@ -370,6 +415,7 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 let originalLayer = null;
 let snappedLayer  = null;
 let unsnappedLayer = null;
+let splicedLayer  = null;
 
 // ============================================================
 // STATE
@@ -381,6 +427,7 @@ let elapsedSec   = 0;
 let startedAt    = null;
 let fileBlob     = null;
 let snapping     = false;
+let aborted      = false;  // set by Abort button; long loops check and bail
 
 // Elevation state
 let elevData     = [];   // [{lat,lon,ele,dist}] — result points with cumulative distance
@@ -407,6 +454,17 @@ fileInput.addEventListener("change", () => {
 
 document.getElementById("reset-btn").addEventListener("click", resetAll);
 document.getElementById("download-btn").addEventListener("click", downloadResult);
+document.getElementById("abort-btn").addEventListener("click", abortJob);
+
+function abortJob() {
+  aborted = true;
+  clearInterval(pollTimer);
+  stopElapsed();
+  snapping = false;
+  hide("abort-btn");
+  setStatus("error", "Aborted");
+  document.getElementById("progress-label").textContent = "Aborted by user";
+}
 
 // ============================================================
 // HAVERSINE
@@ -446,11 +504,16 @@ async function handleFile(file) {
 
   if (!trkpts.length) { showError("No trackpoints found in this GPX file."); return; }
 
-  const pts = Array.from(trkpts).map(t => ({
-    lat: parseFloat(t.getAttribute("lat")),
-    lon: parseFloat(t.getAttribute("lon")),
-    time: t.querySelector("time")?.textContent,
-  }));
+  const pts = Array.from(trkpts).map(t => {
+    const eleEl = t.querySelector("ele");
+    const ele   = eleEl ? parseFloat(eleEl.textContent) : null;
+    return {
+      lat:  parseFloat(t.getAttribute("lat")),
+      lon:  parseFloat(t.getAttribute("lon")),
+      time: t.querySelector("time")?.textContent,
+      ele:  Number.isFinite(ele) ? ele : null,
+    };
+  });
 
   // Duration
   let dur = "—";
@@ -470,6 +533,11 @@ async function handleFile(file) {
   // Draw original track on map
   drawOriginal(pts);
 
+  // Show raw (unrefined) elevation graph immediately, if present
+  if (pts.some(p => p.ele !== null)) {
+    initElevPanel(pts, pts.map(p => p.ele));
+  }
+
   // Upload to backend
   uploadFile(file);
 }
@@ -488,8 +556,10 @@ async function uploadFile(file) {
   const fd = new FormData();
   fd.append("file", file);
 
+  aborted = false;
   setStatus("working", "Uploading…");
   show("status-card");
+  show("abort-btn");
 
   try {
     const res  = await fetch(`${BACKEND_URL}/upload`, { method: "POST", body: fd });
@@ -509,6 +579,7 @@ async function uploadFile(file) {
 function startPolling() {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   pollTimer = setInterval(async () => {
+    if (aborted) { clearInterval(pollTimer); return; }
     if (Date.now() > deadline) {
       clearInterval(pollTimer);
       showError("Timed out waiting for backend after 5 minutes.");
@@ -642,8 +713,10 @@ function buildChunks(coarse, junctionSet) {
 // --- ORS call: globally throttled + 429 backoff ---
 let _lastOrsCall = 0;
 async function orsThrottle() {
+  if (aborted) throw new Error("__ABORTED__");
   const wait = ORS_SLEEP_MS - (Date.now() - _lastOrsCall);
   if (wait > 0) await sleep(wait);
+  if (aborted) throw new Error("__ABORTED__");
   _lastOrsCall = Date.now();
 }
 
@@ -728,55 +801,60 @@ async function bisectSnap(pts, s, e, depth, out) {
 
 // --- Main ---
 async function snapAllSegments(origPts) {
-  const { set: junctionSet, coarse } = detectJunctions(origPts);
-  const chunks = buildChunks(coarse, junctionSet);
+  try {
+    const { set: junctionSet, coarse } = detectJunctions(origPts);
+    const chunks = buildChunks(coarse, junctionSet);
 
-  // PASS 1 — dense snap per chunk
-  document.getElementById("s-segs").textContent = `${chunks.length}`;
-  const pass1 = []; // { s, e, snapped }
-  for (let i = 0; i < chunks.length; i++) {
-    const [s, e] = chunks[i];
-    setProgress(Math.round(5 + 50 * (i + 1) / chunks.length));
-    setStatus("working", `Pass 1 — segment ${i+1} / ${chunks.length}`);
-    pass1.push({ s, e, snapped: await trySnapRange(origPts, s, e) });
-  }
-
-  // PASS 2 — recursive bisection on rejected chunks
-  const failed = pass1.filter(p => p.snapped === null);
-  document.getElementById("s-segs").textContent = `${chunks.length} (${failed.length} refining)`;
-
-  const ordered = []; // final contiguous segment list for backend
-  let p2done = 0;
-  for (const p of pass1) {
-    if (p.snapped !== null) {
-      ordered.push({ start_idx: p.s, end_idx: p.e, result: p.snapped });
-      continue;
+    // PASS 1 — dense snap per chunk
+    document.getElementById("s-segs").textContent = `${chunks.length}`;
+    const pass1 = []; // { s, e, snapped }
+    for (let i = 0; i < chunks.length; i++) {
+      const [s, e] = chunks[i];
+      setProgress(Math.round(5 + 50 * (i + 1) / chunks.length));
+      setStatus("working", `Pass 1 — segment ${i+1} / ${chunks.length}`);
+      pass1.push({ s, e, snapped: await trySnapRange(origPts, s, e) });
     }
-    p2done++;
-    setProgress(Math.round(56 + 40 * p2done / Math.max(failed.length, 1)));
-    setStatus("working", `Pass 2 — refining gap ${p2done} / ${failed.length}`);
 
-    if ((p.e - p.s) <= MIN_SEG_POINTS) {
-      ordered.push({ start_idx: p.s, end_idx: p.e, result: null });
-    } else {
-      const sub = [];
-      const mid = p.s + Math.floor((p.e - p.s) / 2);
-      await bisectSnap(origPts, p.s, mid, 1, sub);
-      await bisectSnap(origPts, mid, p.e, 1, sub);
-      for (const x of sub) ordered.push(x);
+    // PASS 2 — recursive bisection on rejected chunks
+    const failed = pass1.filter(p => p.snapped === null);
+    document.getElementById("s-segs").textContent = `${chunks.length} (${failed.length} refining)`;
+
+    const ordered = []; // final contiguous segment list for backend
+    let p2done = 0;
+    for (const p of pass1) {
+      if (p.snapped !== null) {
+        ordered.push({ start_idx: p.s, end_idx: p.e, result: p.snapped });
+        continue;
+      }
+      p2done++;
+      setProgress(Math.round(56 + 40 * p2done / Math.max(failed.length, 1)));
+      setStatus("working", `Pass 2 — refining gap ${p2done} / ${failed.length}`);
+
+      if ((p.e - p.s) <= MIN_SEG_POINTS) {
+        ordered.push({ start_idx: p.s, end_idx: p.e, result: null });
+      } else {
+        const sub = [];
+        const mid = p.s + Math.floor((p.e - p.s) / 2);
+        await bisectSnap(origPts, p.s, mid, 1, sub);
+        await bisectSnap(origPts, mid, p.e, 1, sub);
+        for (const x of sub) ordered.push(x);
+      }
     }
+
+    // Submit
+    setStatus("working", "Finalising…");
+    setProgress(97);
+    await fetch(`${BACKEND_URL}/submit_snapped/${jobId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ segments: ordered }),
+    });
+
+    startPolling();
+  } catch (e) {
+    if (e.message === "__ABORTED__") return;  // abortJob already updated UI
+    showError(e.message);
   }
-
-  // Submit
-  setStatus("working", "Finalising…");
-  setProgress(97);
-  await fetch(`${BACKEND_URL}/submit_snapped/${jobId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ segments: ordered }),
-  });
-
-  startPolling();
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -801,30 +879,35 @@ let elevRaf     = 0;     // pending rAF handle for coalescing
 
 function buildElevData(resultPts, elevArr) {
   elevData = new Array(resultPts.length);
-  let dist = 0, eMin = Infinity, eMax = -Infinity;
-  let firstValid = -1, lastValid = -1, gain = 0, loss = 0, prevEle = null;
-
+  let dist = 0;
   for (let i = 0; i < resultPts.length; i++) {
     if (i > 0) dist += haversine(resultPts[i-1].lat, resultPts[i-1].lon, resultPts[i].lat, resultPts[i].lon);
     const ele = elevArr[i] ?? null;
     elevData[i] = { lat: resultPts[i].lat, lon: resultPts[i].lon, ele, dist };
-
-    if (ele !== null) {
-      if (ele < eMin) eMin = ele;
-      if (ele > eMax) eMax = ele;
-      if (firstValid === -1) firstValid = i;
-      lastValid = i;
-      if (prevEle !== null) {
-        const d = ele - prevEle;
-        if (d > 0) gain += d; else loss -= d;
-      }
-      prevEle = ele;
-    }
   }
+  computeElevStats();
+}
 
+// (Re)compute elevation stats from current elevData. Distances are unchanged
+// when only elevation values are corrected, so this is safe to call after a fix.
+function computeElevStats() {
+  let eMin = Infinity, eMax = -Infinity;
+  let firstValid = -1, lastValid = -1, gain = 0, loss = 0, prevEle = null;
+  for (let i = 0; i < elevData.length; i++) {
+    const ele = elevData[i].ele;
+    if (ele === null) continue;
+    if (ele < eMin) eMin = ele;
+    if (ele > eMax) eMax = ele;
+    if (firstValid === -1) firstValid = i;
+    lastValid = i;
+    if (prevEle !== null) { const d = ele - prevEle; if (d > 0) gain += d; else loss -= d; }
+    prevEle = ele;
+  }
+  const dMax = elevData.length ? elevData[elevData.length - 1].dist : 1;
   elevStats = {
-    eMin, eRange: Math.max(eMax - eMin, 1),
-    dMax: dist || 1,
+    eMin: eMin === Infinity ? 0 : eMin,
+    eRange: Math.max(eMax - eMin, 1),
+    dMax: dMax || 1,
     firstValid, lastValid, gain, loss,
   };
 }
@@ -1006,6 +1089,11 @@ window.addEventListener("resize", () => {
   }, 150);
 });
 
+function setElevGainLossLabel() {
+  document.getElementById("elev-info").textContent =
+    `↑ ${Math.round(elevStats.gain)} m  ↓ ${Math.round(elevStats.loss)} m`;
+}
+
 function initElevPanel(resultPts, elevArr) {
   buildElevData(resultPts, elevArr);
   elevSlider.max   = elevData.length - 1;
@@ -1017,13 +1105,245 @@ function initElevPanel(resultPts, elevArr) {
   renderElevStatic();
   renderElevCursor(-1);        // static only, no cursor yet
 
-  document.getElementById("elev-info").textContent =
-    `↑ ${Math.round(elevStats.gain)} m  ↓ ${Math.round(elevStats.loss)} m`;
+  setElevGainLossLabel();
+}
+
+// ============================================================
+// PASS 3 — ELEVATION FIX (ORS /elevation/line, SRTM)
+// ============================================================
+const ELEV_BATCH = 500;  // coordinates per ORS elevation request
+
+async function orsElevationBatch(coords, attempt = 0) {
+  await orsThrottle();
+  const res = await fetch("https://api.openrouteservice.org/elevation/line", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": ORS_API_KEY },
+    body: JSON.stringify({ format_in: "polyline", format_out: "geojson", geometry: coords }),
+  });
+  if (res.status === 429) {
+    if (attempt >= 3) throw new Error("rate limited");
+    const w = 2000 * Math.pow(2, attempt);
+    await sleep(w);
+    return orsElevationBatch(coords, attempt + 1);
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data   = await res.json();
+  const out    = data.geometry?.coordinates || data.geometry;
+  if (!out) throw new Error("no elevation geometry");
+  return out.map(c => c[2]);  // [lon, lat, ele] → ele
+}
+
+const fixElevBtn = document.getElementById("fix-elev-btn");
+fixElevBtn.addEventListener("click", fixElevation);
+
+async function fixElevation() {
+  if (!elevData.length || !jobId) return;
+  fixElevBtn.disabled = true;
+
+  const coords = elevData.map(p => [p.lon, p.lat]);
+  const newEle = new Array(coords.length).fill(null);
+
+  for (let s = 0; s < coords.length; s += ELEV_BATCH) {
+    const batch = coords.slice(s, s + ELEV_BATCH);
+    fixElevBtn.textContent = `Fixing… ${Math.min(s + ELEV_BATCH, coords.length)} / ${coords.length}`;
+    let eles;
+    try {
+      eles = await orsElevationBatch(batch);
+    } catch (e) {
+      fixElevBtn.disabled  = false;
+      fixElevBtn.textContent = "Fix elevation (pass 3)";
+      if (e.message !== "__ABORTED__") showError("Elevation fix failed: " + e.message);
+      return;
+    }
+    for (let i = 0; i < eles.length && (s + i) < newEle.length; i++) {
+      if (Number.isFinite(eles[i])) newEle[s + i] = eles[i];
+    }
+  }
+
+  // Replace elevation in-place (keep original where ORS returned nothing)
+  for (let i = 0; i < elevData.length; i++) {
+    if (newEle[i] !== null) elevData[i].ele = newEle[i];
+  }
+  computeElevStats();
+  layoutElev();
+  renderElevStatic();
+  renderElevCursor(elevCurIdx);
+  setElevGainLossLabel();
+
+  // Rebuild downloadable GPX with corrected elevation
+  fixElevBtn.textContent = "Saving…";
+  try {
+    await fetch(`${BACKEND_URL}/submit_elevation/${jobId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ele: newEle }),
+    });
+  } catch (e) {
+    showError("Saving corrected elevation failed: " + e.message);
+    fixElevBtn.disabled = false;
+    fixElevBtn.textContent = "Fix elevation (pass 3)";
+    return;
+  }
+
+  fixElevBtn.textContent = "Elevation fixed ✓";
+  fixElevBtn.classList.add("done");
+}
+
+// ============================================================
+// SPLICE GAPS — route across straight-line GPS dropouts
+// ============================================================
+// A dropout shows up as a long, near-straight run of kept-original (orange)
+// points: the recorder lost signal and the two ends were joined by a straight
+// line. We detect those runs (long chord + low path/chord ratio) and ask ORS
+// to route along the real road between the endpoints, bypassing the normal
+// deviation check (the straight line IS far off-road — that's the point).
+const GAP_MIN_DIST     = 150;   // metres — min straight-line span to treat as a dropout
+const GAP_STRAIGHTNESS = 1.15;  // path/chord ratio at or below which a run is "straight"
+
+const spliceBtn = document.getElementById("splice-btn");
+spliceBtn.addEventListener("click", spliceGaps);
+
+function detectGaps() {
+  const sm = segMapGlobal, pts = resultPtsGlobal, gaps = [];
+  let i = 0;
+  while (i < sm.length) {
+    if (sm[i] !== "original") { i++; continue; }
+    let j = i;
+    while (j + 1 < sm.length && sm[j + 1] === "original") j++;
+    if (j > i) {
+      const chord = haversine(pts[i].lat, pts[i].lon, pts[j].lat, pts[j].lon);
+      let path = 0;
+      for (let k = i + 1; k <= j; k++) path += haversine(pts[k-1].lat, pts[k-1].lon, pts[k].lat, pts[k].lon);
+      const straightness = chord > 0 ? path / chord : Infinity;
+      if (chord >= GAP_MIN_DIST && straightness <= GAP_STRAIGHTNESS) {
+        gaps.push({ start: i, end: j, chord });
+      }
+    }
+    i = j + 1;
+  }
+  return gaps;
+}
+
+// Route between waypoints, first profile that returns geometry; no deviation check.
+async function routeRaw(wpts) {
+  for (const profile of ORS_PROFILES) {
+    try { return await orsRoute(profile, wpts); } catch (_) { /* next */ }
+  }
+  return null;
+}
+
+async function spliceGaps() {
+  if (!resultPtsGlobal.length || !jobId) return;
+  hide("warn-box");
+  spliceBtn.disabled = true;
+
+  const gaps = detectGaps();
+  if (!gaps.length) {
+    spliceBtn.textContent = "No gaps found";
+    setTimeout(() => { spliceBtn.textContent = "Splice gaps"; spliceBtn.disabled = false; }, 2500);
+    return;
+  }
+
+  const splices = [], failed = [];
+  for (let g = 0; g < gaps.length; g++) {
+    if (aborted) { spliceBtn.textContent = "Splice gaps"; spliceBtn.disabled = false; return; }
+    const gap = gaps[g];
+    spliceBtn.textContent = `Splicing… ${g + 1} / ${gaps.length}`;
+    const a = resultPtsGlobal[gap.start], b = resultPtsGlobal[gap.end];
+    const routed = await routeRaw([{ lat: a.lat, lon: a.lon }, { lat: b.lat, lon: b.lon }]);
+    if (routed && routed.length >= 2) {
+      routed[0]                 = { lat: a.lat, lon: a.lon }; // pin endpoints
+      routed[routed.length - 1] = { lat: b.lat, lon: b.lon };
+      splices.push({ start: gap.start, end: gap.end, points: routed });
+    } else {
+      failed.push(gap);
+    }
+  }
+
+  if (splices.length) {
+    spliceBtn.textContent = "Saving…";
+    let data;
+    try {
+      const res = await fetch(`${BACKEND_URL}/submit_splice/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ splices }),
+      });
+      data = await res.json();
+      if (!res.ok) throw new Error(data.error || "splice save failed");
+    } catch (e) {
+      showError("Splice save failed: " + e.message);
+      spliceBtn.disabled = false; spliceBtn.textContent = "Splice gaps";
+      return;
+    }
+
+    // Redraw with updated result
+    segMapGlobal    = data.segment_map   || segMapGlobal;
+    resultPtsGlobal = data.result_points || resultPtsGlobal;
+    drawTrackLayers(origPtsGlobal, resultPtsGlobal, segMapGlobal);
+    applySummary(data.summary || {});
+    if (data.result_points_ele && data.result_points_ele.some(e => e !== null)) {
+      initElevPanel(resultPtsGlobal, data.result_points_ele);
+    }
+  }
+
+  if (failed.length) {
+    const dists = failed.map(g => fmtDist(elevData[g.start] ? elevData[g.start].dist : 0)).join(", ");
+    showWarn(`${failed.length} gap(s) had no road route and were left as straight lines (at ${dists}).`);
+  }
+
+  spliceBtn.textContent = splices.length ? "Gaps spliced ✓" : "No road found";
+  if (splices.length) spliceBtn.classList.add("done");
+}
+
+// Track + summary state reused by splice
+let segMapGlobal    = [];
+let resultPtsGlobal = [];
+let origPtsGlobal   = [];
+
+function drawTrackLayers(origPts, resultPts, segMap) {
+  if (originalLayer) map.removeLayer(originalLayer);
+  originalLayer = L.polyline(origPts.map(p => [p.lat, p.lon]), { color: "#3b82f6", weight: 2, opacity: .4, dashArray: "5,5" }).addTo(map);
+
+  // Group consecutive points by tag into colored polylines
+  const greenSegs = [], orangeSegs = [], violetSegs = [];
+  let curSeg = [], curTag = null;
+  const pushSeg = () => {
+    if (curSeg.length <= 1) return;
+    if (curTag === "snapped")      greenSegs.push([...curSeg]);
+    else if (curTag === "spliced") violetSegs.push([...curSeg]);
+    else                           orangeSegs.push([...curSeg]);
+  };
+  for (let i = 0; i < resultPts.length; i++) {
+    const tag = segMap[i] || "original";
+    if (tag !== curTag) {
+      pushSeg();
+      curSeg = i > 0 ? [[resultPts[i-1].lat, resultPts[i-1].lon]] : [];
+      curTag = tag;
+    }
+    curSeg.push([resultPts[i].lat, resultPts[i].lon]);
+  }
+  pushSeg();
+
+  if (snappedLayer)   map.removeLayer(snappedLayer);
+  if (unsnappedLayer) map.removeLayer(unsnappedLayer);
+  if (splicedLayer)   map.removeLayer(splicedLayer);
+  snappedLayer   = L.polyline(greenSegs,  { color: "#16a34a", weight: 4, opacity: .9 }).addTo(map);
+  unsnappedLayer = L.polyline(orangeSegs, { color: "#ea580c", weight: 4, opacity: .9 }).addTo(map);
+  splicedLayer   = L.polyline(violetSegs, { color: "#7c3aed", weight: 4, opacity: .9 }).addTo(map);
+}
+
+function applySummary(summary) {
+  document.getElementById("r-snapped").textContent   = `${summary.snapped_pct ?? 0}%`;
+  document.getElementById("r-unsnapped").textContent = `${summary.unsnapped_pct ?? 0}%`;
+  document.getElementById("r-dist").textContent      = fmtDist(summary.total_distance_m || 0);
+  document.getElementById("r-orig-dist").textContent = fmtDist(summary.original_distance_m || 0);
 }
 
 function renderResults(data) {
   setStatus("done", "Complete");
   setProgress(100);
+  hide("abort-btn");
 
   const origPts   = data.original_points   || [];
   const resultPts = data.result_points     || [];
@@ -1031,54 +1351,34 @@ function renderResults(data) {
   const segMap    = data.segment_map       || [];
   const summary   = data.summary           || {};
 
-  // Redraw original (lighter)
-  if (originalLayer) map.removeLayer(originalLayer);
-  originalLayer = L.polyline(origPts.map(p => [p.lat, p.lon]), { color: "#3b82f6", weight: 2, opacity: .4, dashArray: "5,5" }).addTo(map);
+  segMapGlobal    = segMap;
+  resultPtsGlobal = resultPts;
+  origPtsGlobal   = origPts;
 
-  // Build snapped / unsnapped polylines
-  let greenSegs = [], orangeSegs = [];
-  let curSeg = [], curTag = null;
-
-  for (let i = 0; i < resultPts.length; i++) {
-    const tag = segMap[i] || "original";
-    if (tag !== curTag) {
-      if (curSeg.length > 1) {
-        if (curTag === "snapped") greenSegs.push([...curSeg]);
-        else orangeSegs.push([...curSeg]);
-      }
-      curSeg = i > 0 ? [[resultPts[i-1].lat, resultPts[i-1].lon]] : [];
-      curTag = tag;
-    }
-    curSeg.push([resultPts[i].lat, resultPts[i].lon]);
-  }
-  if (curSeg.length > 1) {
-    if (curTag === "snapped") greenSegs.push(curSeg);
-    else orangeSegs.push(curSeg);
-  }
-
-  if (snappedLayer)   map.removeLayer(snappedLayer);
-  if (unsnappedLayer) map.removeLayer(unsnappedLayer);
-  snappedLayer   = L.polyline(greenSegs,  { color: "#16a34a", weight: 4, opacity: .9 }).addTo(map);
-  unsnappedLayer = L.polyline(orangeSegs, { color: "#ea580c", weight: 4, opacity: .9 }).addTo(map);
+  drawTrackLayers(origPts, resultPts, segMap);
 
   const allBounds = [...origPts, ...resultPts].map(p => [p.lat, p.lon]);
   if (allBounds.length) map.fitBounds(L.latLngBounds(allBounds), { padding: [20, 20] });
 
-  // Summary stats
-  document.getElementById("r-snapped").textContent   = `${summary.snapped_pct ?? 0}%`;
-  document.getElementById("r-unsnapped").textContent = `${summary.unsnapped_pct ?? 0}%`;
-  document.getElementById("r-dist").textContent      = fmtDist(summary.total_distance_m || 0);
-  document.getElementById("r-orig-dist").textContent = fmtDist(summary.original_distance_m || 0);
+  applySummary(summary);
 
   show("results-card");
   show("legend-card");
   show("download-btn");
   show("reset-btn");
 
-  // Elevation panel
+  // Elevation panel (re-init with snapped result points) + reveal Pass 3 / splice
   if (resultPts.length && elevArr.some(e => e !== null)) {
     initElevPanel(resultPts, elevArr);
+    fixElevBtn.classList.remove("hidden", "done");
+    fixElevBtn.disabled = false;
+    fixElevBtn.textContent = "Fix elevation (pass 3)";
   }
+
+  // Reveal splice button if any gaps look spliceable
+  spliceBtn.classList.remove("hidden", "done");
+  spliceBtn.disabled = false;
+  spliceBtn.textContent = "Splice gaps";
 }
 
 // ============================================================
@@ -1118,11 +1418,18 @@ function setProgress(pct) {
 
 function showError(msg) {
   snapping = false;
+  hide("abort-btn");
   const box = document.getElementById("error-box");
   box.textContent = "Error: " + msg;
   show("error-box");
   setStatus("error", "Failed");
   stopElapsed();
+}
+
+function showWarn(msg) {
+  const box = document.getElementById("warn-box");
+  box.textContent = msg;
+  show("warn-box");
 }
 
 function show(id) { document.getElementById(id).classList.remove("hidden"); }
@@ -1147,11 +1454,16 @@ function resetAll(full = true) {
   clearInterval(elapsedTimer);
   jobId    = null;
   snapping = false;
+  aborted  = false;
   elevData = [];
+  segMapGlobal = [];
+  resultPtsGlobal = [];
+  origPtsGlobal = [];
   if (cursorMarker)  { map.removeLayer(cursorMarker);  cursorMarker  = null; }
   if (originalLayer)  { map.removeLayer(originalLayer);  originalLayer  = null; }
   if (snappedLayer)   { map.removeLayer(snappedLayer);   snappedLayer   = null; }
   if (unsnappedLayer) { map.removeLayer(unsnappedLayer); unsnappedLayer = null; }
+  if (splicedLayer)   { map.removeLayer(splicedLayer);   splicedLayer   = null; }
 
   hide("file-summary");
   hide("status-card");
@@ -1161,7 +1473,17 @@ function resetAll(full = true) {
   hide("reset-btn");
   hide("error-box");
   hide("elapsed-wrap");
+  hide("abort-btn");
   hide("elev-panel");
+  hide("warn-box");
+  fixElevBtn.classList.add("hidden");
+  fixElevBtn.classList.remove("done");
+  fixElevBtn.disabled = false;
+  fixElevBtn.textContent = "Fix elevation (pass 3)";
+  spliceBtn.classList.add("hidden");
+  spliceBtn.classList.remove("done");
+  spliceBtn.disabled = false;
+  spliceBtn.textContent = "Splice gaps";
 
   document.getElementById("progress-fill").style.width = "0%";
   fileInput.value = "";

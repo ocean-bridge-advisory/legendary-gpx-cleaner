@@ -222,6 +222,7 @@ def finalise_job(job_id):
         gpx_xml = build_gpx(job["gpx_obj"], result_points)
 
         job["result_gpx"]         = gpx_xml
+        job["result_full"]        = result_points  # full dicts (lat/lon/ele/time/ext) for elevation rebuild
         job["result_points"]      = [{"lat": p["lat"], "lon": p["lon"]} for p in result_points]
         job["result_points_ele"]  = [p.get("ele") for p in result_points]
         job["segment_map"]        = segment_map
@@ -306,6 +307,24 @@ def submit_snapped(job_id):
         job["snapped_segments"] = data.get("snapped_segments", {})
     t = threading.Thread(target=finalise_job, args=(job_id,), daemon=True)
     t.start()
+    return jsonify({"ok": True})
+
+
+@app.route("/submit_elevation/<job_id>", methods=["POST"])
+def submit_elevation(job_id):
+    """Frontend POSTs corrected elevation array; backend rebuilds the GPX."""
+    job = jobs.get(job_id)
+    if not job or "result_full" not in job:
+        return jsonify({"error": "Result not ready"}), 404
+
+    ele = (request.get_json() or {}).get("ele", [])
+    pts = job["result_full"]
+    for i, p in enumerate(pts):
+        if i < len(ele) and ele[i] is not None:
+            p["ele"] = ele[i]
+
+    job["result_gpx"]        = build_gpx(job["gpx_obj"], pts)
+    job["result_points_ele"] = [p.get("ele") for p in pts]
     return jsonify({"ok": True})
 
 

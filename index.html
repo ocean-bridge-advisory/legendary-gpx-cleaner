@@ -401,7 +401,7 @@ const ORS_API_KEY      = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ij
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS  = 300_000; // 5 min
 const ORS_PROFILES     = ["driving-car", "cycling-road", "cycling-mountain"];
-const DEVIATION_LIMIT   = 25;   // metres
+const DEVIATION_LIMIT   = 60;   // metres — main-road rides tolerate looser matching
 const ORS_SLEEP_MS      = 1600; // 40 req/min = 1500ms min; 1600ms gives headroom
 const BEARING_THRESHOLD = 35;   // degrees — junction turn threshold
 
@@ -799,7 +799,9 @@ async function snapLeg(pts, s, e, depth, out, progress) {
 // --- Main ---
 async function snapAllSegments(origPts) {
   try {
-    // Junction list = sorted original indices (always includes 0 and last)
+    // Junction list = sorted original indices (always includes 0 and last).
+    // Legs are routed directly; only legs that fail the deviation check get
+    // subdivided (rides follow main roads, so most long legs match first try).
     const { set: junctionSet } = detectJunctions(origPts);
     const junctions = [...junctionSet].sort((a, b) => a - b);
     const legCount  = junctions.length - 1;

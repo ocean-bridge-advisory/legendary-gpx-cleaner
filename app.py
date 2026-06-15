@@ -202,7 +202,7 @@ def track_to_json(result_points):
 # Background processing worker
 # ---------------------------------------------------------------------------
 
-DEVIATION_THRESHOLD = 25   # metres — matches frontend
+DEVIATION_THRESHOLD = 60   # metres — must match frontend DEVIATION_LIMIT
 
 
 def process_job(job_id, gpx_bytes):

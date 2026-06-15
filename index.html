@@ -1099,12 +1099,11 @@ elevCanvas.addEventListener("click", e => {
   setElevCursor(lo);
 });
 
-// Map click → either elevation cursor, or manual-gap endpoint selection
+// Map click → either elevation cursor, or manual-gap point selection
 map.on("click", e => {
+  if (pickMode) { handlePickMapClick(e.latlng); return; }
   if (!elevData.length) return;
-  const idx = nearestIdxToLatLon(e.latlng.lat, e.latlng.lng);
-  if (pickMode) { handlePickClick(idx); return; }
-  setElevCursor(idx);
+  setElevCursor(nearestIdxToLatLon(e.latlng.lat, e.latlng.lng));
 });
 
 // Redraw static layer on resize (debounced)
@@ -1412,24 +1411,35 @@ async function submitSplices(splices, btn, idleLabel) {
   return true;
 }
 
-// ── Manual gap picking (N waypoints; road route if possible, else polyline) ──
-let pickMode    = false;
-let pickPts     = [];   // [{idx, lat, lon}] in click order
-let pickMarkers = [];
+// ── Manual gap picking ──────────────────────────────────────
+// Points are EXACT click coordinates. The first and last points snap to the
+// nearest trackpoint (they anchor the splice into the track by index); the
+// middle points are free-floating exact coordinates that shape the route.
+// Click an existing marker to remove it. The routed line previews live (dashed)
+// and is only written into the track on Commit. Esc cancels.
+let pickMode      = false;
+let pickPts       = [];     // [{lat, lon, anchorIdx|null}] in click order
+let pickMarkers   = [];     // Leaflet markers (interactive, click-to-remove)
+let previewLayer  = null;   // dashed preview polyline
+let previewGeom   = null;   // last routed geometry {points, fellBack}
+let previewTimer  = 0;      // debounce handle
 
 const pickGapBtn = document.getElementById("pick-gap-btn");
 pickGapBtn.addEventListener("click", () => {
-  if (!pickMode)            { enterPickMode(); return; }
-  if (pickPts.length >= 2)  { finishPick(); }
-  else                      { exitPickMode(); }
+  if (!pickMode)           { enterPickMode(); return; }
+  if (pickPts.length >= 2 && previewGeom) { commitPick(); }
+  else                     { exitPickMode(); }
 });
 
 function enterPickMode() {
   pickMode = true;
   pickPts  = [];
+  previewGeom = null;
   clearPickMarkers();
+  clearPreview();
+  hide("warn-box");
   pickGapBtn.classList.add("done");
-  pickGapBtn.textContent = "Click points… (cancel)";
+  pickGapBtn.textContent = "Click points (Esc cancels)";
   if (map.doubleClickZoom) map.doubleClickZoom.disable();
   document.getElementById("map").style.cursor = "crosshair";
 }
@@ -1437,65 +1447,120 @@ function enterPickMode() {
 function exitPickMode() {
   pickMode = false;
   pickPts  = [];
+  previewGeom = null;
   clearPickMarkers();
+  clearPreview();
   pickGapBtn.classList.remove("done");
   pickGapBtn.textContent = "Pick gap";
   if (map.doubleClickZoom) map.doubleClickZoom.enable();
   document.getElementById("map").style.cursor = "";
 }
 
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && pickMode) exitPickMode();
+});
+
 function clearPickMarkers() {
   pickMarkers.forEach(m => map.removeLayer(m));
   pickMarkers = [];
 }
+function clearPreview() {
+  if (previewLayer) { map.removeLayer(previewLayer); previewLayer = null; }
+}
 
-function addPickMarker(idx, label) {
-  const p = resultPtsGlobal[idx];
-  const icon = L.divIcon({
-    className: "",
-    html: `<div style="background:#7c3aed;color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 0 0 1px #7c3aed">${label}</div>`,
-    iconSize: [18, 18], iconAnchor: [9, 9],
+function renderPickMarkers() {
+  clearPickMarkers();
+  pickPts.forEach((pt, i) => {
+    const label = i + 1;
+    const icon = L.divIcon({
+      className: "",
+      html: `<div style="background:#7c3aed;color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 0 0 1px #7c3aed;cursor:pointer">${label}</div>`,
+      iconSize: [18, 18], iconAnchor: [9, 9],
+    });
+    const m = L.marker([pt.lat, pt.lon], { icon, interactive: true }).addTo(map);
+    m.on("click", ev => {
+      L.DomEvent.stopPropagation(ev);          // don't also register a new point
+      pickPts.splice(i, 1);
+      onPickChanged();
+    });
+    pickMarkers.push(m);
   });
-  pickMarkers.push(L.marker([p.lat, p.lon], { icon, interactive: false }).addTo(map));
 }
 
-function handlePickClick(idx) {
-  if (pickPts.some(q => q.idx === idx)) return;  // ignore duplicate point
-  const p = resultPtsGlobal[idx];
-  pickPts.push({ idx, lat: p.lat, lon: p.lon });
-  addPickMarker(idx, pickPts.length);
-  pickGapBtn.textContent = pickPts.length >= 2
-    ? `Splice (${pickPts.length}) →`
-    : "Click more…";
+// Map click in pick mode → add an exact-coordinate point
+function handlePickMapClick(latlng) {
+  // First & last points anchor to nearest trackpoint; recompute anchors on change
+  pickPts.push({ lat: latlng.lat, lon: latlng.lng, anchorIdx: null });
+  onPickChanged();
 }
 
-async function finishPick() {
-  hide("warn-box");
-  const ordered = [...pickPts].sort((a, b) => a.idx - b.idx);
-  const s = ordered[0].idx, e = ordered[ordered.length - 1].idx;
-  if (e - s < 1) { pickGapBtn.textContent = "Pick a wider gap"; return; }
+function onPickChanged() {
+  renderPickMarkers();
+  // Recompute anchors: first and last picked points snap to nearest trackpoint
+  if (pickPts.length >= 1) {
+    pickPts.forEach(p => { p.anchorIdx = null; });
+    pickPts[0].anchorIdx = nearestIdxToLatLon(pickPts[0].lat, pickPts[0].lon);
+    pickPts[pickPts.length - 1].anchorIdx = nearestIdxToLatLon(pickPts[pickPts.length - 1].lat, pickPts[pickPts.length - 1].lon);
+  }
+  updatePickButtonLabel();
 
-  pickGapBtn.disabled = true;
-  pickGapBtn.textContent = "Routing…";
-  const wpts = ordered.map(q => ({ lat: q.lat, lon: q.lon }));
+  // Debounced live preview routing
+  clearTimeout(previewTimer);
+  if (pickPts.length >= 2) {
+    pickGapBtn.textContent = "Routing preview…";
+    previewTimer = setTimeout(refreshPreview, 350);
+  } else {
+    previewGeom = null;
+    clearPreview();
+  }
+}
 
-  // Try a road route through all clicked points; fall back to a straight
-  // polyline connecting the clicked points if no road is found.
+function updatePickButtonLabel() {
+  if (pickPts.length < 2)      pickGapBtn.textContent = "Click more…";
+  else if (previewGeom)        pickGapBtn.textContent = `Commit (${pickPts.length}) ✓`;
+  else                         pickGapBtn.textContent = `Splice (${pickPts.length})`;
+}
+
+async function refreshPreview() {
+  const wpts = pickPts.map(p => ({ lat: p.lat, lon: p.lon }));
   let geometry = await routeRaw(wpts);
   let fellBack = false;
   if (geometry && geometry.length >= 2) {
-    geometry[0]                   = { lat: ordered[0].lat, lon: ordered[0].lon };
-    geometry[geometry.length - 1] = { lat: ordered[ordered.length - 1].lat, lon: ordered[ordered.length - 1].lon };
+    geometry[0]                   = { lat: wpts[0].lat, lon: wpts[0].lon };
+    geometry[geometry.length - 1] = { lat: wpts[wpts.length - 1].lat, lon: wpts[wpts.length - 1].lon };
   } else {
-    geometry = wpts.map(w => ({ lat: w.lat, lon: w.lon }));  // polyline through clicked points
+    geometry = wpts;       // straight polyline through exact clicks
     fellBack = true;
   }
-  pickGapBtn.disabled = false;
+  previewGeom = { points: geometry, fellBack };
 
-  const ok = await submitSplices([{ start: s, end: e, points: geometry }], pickGapBtn, "Pick gap");
+  clearPreview();
+  previewLayer = L.polyline(geometry.map(p => [p.lat, p.lon]), {
+    color: "#7c3aed", weight: 4, opacity: .9, dashArray: "6,5",
+  }).addTo(map);
+
+  updatePickButtonLabel();
+}
+
+async function commitPick() {
+  if (!previewGeom || pickPts.length < 2) return;
+  const a = pickPts[0].anchorIdx, b = pickPts[pickPts.length - 1].anchorIdx;
+  let s = a, e = b;
+  if (e < s) [s, e] = [e, s];
+  if (e - s < 1) { pickGapBtn.textContent = "Anchors too close"; return; }
+
+  // Pin commit geometry endpoints to the anchor trackpoints so it grafts cleanly
+  const geom = previewGeom.points.map(p => ({ lat: p.lat, lon: p.lon }));
+  geom[0]              = { lat: resultPtsGlobal[s].lat, lon: resultPtsGlobal[s].lon };
+  geom[geom.length-1] = { lat: resultPtsGlobal[e].lat, lon: resultPtsGlobal[e].lon };
+  const fellBack = previewGeom.fellBack;
+
+  pickGapBtn.disabled = true;
+  const ok = await submitSplices([{ start: s, end: e, points: geom }], pickGapBtn, "Pick gap");
+  pickGapBtn.disabled = false;
   exitPickMode();
   if (ok !== false) {
-    if (fellBack) showWarn("No road found — connected your clicked points with straight segments (tagged as spliced).");
+    if (fellBack) showWarn("No road found for part of the route — used straight segments through your exact points (tagged as spliced).");
     pickGapBtn.textContent = fellBack ? "Spliced (straight) ✓" : "Gap spliced ✓";
     pickGapBtn.classList.add("done");
     setTimeout(() => { pickGapBtn.textContent = "Pick gap"; pickGapBtn.classList.remove("done"); }, 3000);
@@ -1714,6 +1779,7 @@ function resetAll(full = true) {
   spliceBtn.disabled = false;
   spliceBtn.textContent = "Splice gaps";
   if (typeof exitPickMode === "function") exitPickMode();
+  if (previewLayer) { map.removeLayer(previewLayer); previewLayer = null; }
   pickGapBtn.classList.add("hidden");
   pickGapBtn.disabled = false;
   pickGapBtn.textContent = "Pick gap";

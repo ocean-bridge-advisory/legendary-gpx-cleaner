@@ -975,6 +975,30 @@ function renderElevStatic() {
   ctx.lineWidth   = 1.5;
   ctx.stroke();
 
+  // Dashed red lines across null-elevation spans
+  // Find the last valid point before each null run and the first after it,
+  // then draw a thin dashed red line connecting them at their respective y positions.
+  ctx.strokeStyle = "#ef4444";
+  ctx.lineWidth   = 1;
+  ctx.setLineDash([3, 4]);
+  let prevValidIdx = -1;
+  for (let i = firstValid; i <= lastValid; i++) {
+    if (elevData[i].ele !== null) { prevValidIdx = i; continue; }
+    // Start of a null run — find end
+    let j = i;
+    while (j + 1 <= lastValid && elevData[j + 1].ele === null) j++;
+    // prevValidIdx → j+1 (next valid after run)
+    const nextValidIdx = j + 1 <= lastValid ? j + 1 : -1;
+    if (prevValidIdx !== -1 && nextValidIdx !== -1) {
+      ctx.beginPath();
+      ctx.moveTo(xOf(elevData[prevValidIdx].dist), yOf(elevData[prevValidIdx].ele));
+      ctx.lineTo(xOf(elevData[nextValidIdx].dist), yOf(elevData[nextValidIdx].ele));
+      ctx.stroke();
+    }
+    i = j; // skip rest of null run
+  }
+  ctx.setLineDash([]);
+
   // Y-axis labels + gridlines
   ctx.fillStyle    = "#6b7280";
   ctx.font         = "10px system-ui";
@@ -1176,26 +1200,14 @@ async function fixElevation() {
   for (let i = 0; i < elevData.length; i++) {
     if (newEle[i] !== null) elevData[i].ele = newEle[i];
   }
+  for (let i = 0; i < trackFull.length && i < newEle.length; i++) {
+    if (newEle[i] !== null) trackFull[i].ele = newEle[i];
+  }
   computeElevStats();
   layoutElev();
   renderElevStatic();
   renderElevCursor(elevCurIdx);
   setElevGainLossLabel();
-
-  // Rebuild downloadable GPX with corrected elevation
-  fixElevBtn.textContent = "Saving…";
-  try {
-    await fetch(`${BACKEND_URL}/submit_elevation/${jobId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ele: newEle }),
-    });
-  } catch (e) {
-    showError("Saving corrected elevation failed: " + e.message);
-    fixElevBtn.disabled = false;
-    fixElevBtn.textContent = "Fix elevation (pass 3)";
-    return;
-  }
 
   fixElevBtn.textContent = "Elevation fixed ✓";
   fixElevBtn.classList.add("done");
@@ -1264,28 +1276,14 @@ async function runSpikeFilter() {
     newEle[i] = a.ele + (d.ele - a.ele) * f;
   }
 
-  // Apply locally + redraw
+  // Apply locally to both elevData and the full track (source of truth)
   for (let i = 0; i < elevData.length; i++) elevData[i].ele = newEle[i];
+  for (let i = 0; i < trackFull.length && i < newEle.length; i++) trackFull[i].ele = newEle[i];
   computeElevStats();
   layoutElev();
   renderElevStatic();
   renderElevCursor(elevCurIdx);
   setElevGainLossLabel();
-
-  // Persist to backend (rebuild GPX with corrected elevation)
-  spikeBtn.textContent = "Saving…";
-  try {
-    await fetch(`${BACKEND_URL}/submit_elevation/${jobId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ele: newEle }),
-    });
-  } catch (e) {
-    showError("Saving spike-filtered elevation failed: " + e.message);
-    spikeBtn.disabled = false;
-    spikeBtn.textContent = "Spike filter";
-    return;
-  }
 
   spikeBtn.textContent = `Removed ${spikes.length} spike${spikes.length === 1 ? "" : "s"} ✓`;
   spikeBtn.classList.add("done");
@@ -1380,27 +1378,32 @@ async function routeGap(startIdx, endIdx) {
   return null;
 }
 
-// POST splices, redraw track/summary/elevation. Returns false on hard error.
+// POST splices to the stateless endpoint, redraw, sync local track. Returns false on hard error.
 async function submitSplices(splices, btn, idleLabel) {
   if (!splices.length) return true;
   btn.textContent = "Saving…";
   let data;
   try {
-    const res = await fetch(`${BACKEND_URL}/submit_splice/${jobId}`, {
+    const res = await fetch(`${BACKEND_URL}/splice`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ splices }),
+      body: JSON.stringify({
+        track:       trackFull,
+        segment_map: segMapGlobal,
+        splices,
+      }),
     });
     data = await res.json();
-    if (!res.ok) throw new Error(data.error || "splice save failed");
+    if (!res.ok) throw new Error(data.error || "splice failed");
   } catch (e) {
-    showError("Splice save failed: " + e.message);
+    showError("Splice failed: " + e.message);
     btn.disabled = false; btn.textContent = idleLabel;
     return false;
   }
 
-  segMapGlobal    = data.segment_map   || segMapGlobal;
-  resultPtsGlobal = data.result_points || resultPtsGlobal;
+  trackFull       = data.track          || trackFull;
+  segMapGlobal    = data.segment_map    || segMapGlobal;
+  resultPtsGlobal = data.result_points  || resultPtsGlobal;
   drawTrackLayers(origPtsGlobal, resultPtsGlobal, segMapGlobal);
   applySummary(data.summary || {});
   if (data.result_points_ele && data.result_points_ele.some(e => e !== null)) {
@@ -1503,6 +1506,8 @@ async function finishPick() {
 let segMapGlobal    = [];
 let resultPtsGlobal = [];
 let origPtsGlobal   = [];
+let trackFull       = [];   // full track [{lat,lon,ele,time,ext_xml}] — source of truth
+let gpxMeta         = {};   // GPX metadata for stateless rebuild
 
 function drawTrackLayers(origPts, resultPts, segMap) {
   if (originalLayer) map.removeLayer(originalLayer);
@@ -1557,6 +1562,8 @@ function renderResults(data) {
   segMapGlobal    = segMap;
   resultPtsGlobal = resultPts;
   origPtsGlobal   = origPts;
+  trackFull       = data.result_track || [];
+  gpxMeta         = data.meta || {};
 
   drawTrackLayers(origPts, resultPts, segMap);
 
@@ -1594,10 +1601,18 @@ function renderResults(data) {
 // DOWNLOAD
 // ============================================================
 async function downloadResult() {
-  if (!jobId) return;
+  if (!trackFull.length) return;
+  const btn = document.getElementById("download-btn");
+  const label = btn.textContent;
+  btn.textContent = "Building GPX…";
+  btn.disabled = true;
   try {
-    const res  = await fetch(`${BACKEND_URL}/download/${jobId}`);
-    if (!res.ok) throw new Error("Download failed");
+    const res = await fetch(`${BACKEND_URL}/build_gpx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ track: trackFull, meta: gpxMeta }),
+    });
+    if (!res.ok) throw new Error("build failed");
     const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
@@ -1607,6 +1622,9 @@ async function downloadResult() {
     URL.revokeObjectURL(url);
   } catch (e) {
     showError("Download failed: " + e.message);
+  } finally {
+    btn.textContent = label;
+    btn.disabled = false;
   }
 }
 
@@ -1668,6 +1686,8 @@ function resetAll(full = true) {
   segMapGlobal = [];
   resultPtsGlobal = [];
   origPtsGlobal = [];
+  trackFull = [];
+  gpxMeta = {};
   if (cursorMarker)  { map.removeLayer(cursorMarker);  cursorMarker  = null; }
   if (originalLayer)  { map.removeLayer(originalLayer);  originalLayer  = null; }
   if (snappedLayer)   { map.removeLayer(snappedLayer);   snappedLayer   = null; }

@@ -109,6 +109,96 @@ def build_gpx(original_gpx, result_points):
 
 
 # ---------------------------------------------------------------------------
+# Stateless GPX building (no remembered job state)
+# ---------------------------------------------------------------------------
+
+def _iso(dt):
+    return dt.isoformat() if dt is not None else None
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def extract_meta(gpx):
+    """Pull GPX metadata into a JSON-safe dict the frontend can hold and return."""
+    trk = gpx.tracks[0] if gpx.tracks else None
+    return {
+        "name":         gpx.name,
+        "description":  gpx.description,
+        "author_name":  gpx.author_name,
+        "author_email": gpx.author_email,
+        "link":         gpx.link,
+        "link_text":    gpx.link_text,
+        "time":         _iso(gpx.time),
+        "keywords":     gpx.keywords,
+        "track_name":   trk.name if trk else None,
+        "track_type":   trk.type if trk else None,
+    }
+
+
+def build_gpx_stateless(track, meta):
+    """Build GPX from plain dicts + a meta dict. Needs no original GPX object.
+
+    track: [{lat, lon, ele, time(ISO str|None), ext_xml(str|None)}]
+    """
+    import xml.etree.ElementTree as ET
+    meta = meta or {}
+
+    g = gpxpy.gpx.GPX()
+    g.name         = meta.get("name")
+    g.description  = meta.get("description")
+    g.author_name  = meta.get("author_name")
+    g.author_email = meta.get("author_email")
+    g.link         = meta.get("link")
+    g.link_text    = meta.get("link_text")
+    g.time         = _parse_iso(meta.get("time"))
+    g.keywords     = meta.get("keywords")
+
+    trk = gpxpy.gpx.GPXTrack()
+    trk.name = meta.get("track_name")
+    trk.type = meta.get("track_type")
+    g.tracks.append(trk)
+    seg = gpxpy.gpx.GPXTrackSegment()
+    trk.segments.append(seg)
+
+    for rp in track:
+        pt = gpxpy.gpx.GPXTrackPoint(
+            latitude=rp.get("lat"),
+            longitude=rp.get("lon"),
+            elevation=rp.get("ele"),
+            time=_parse_iso(rp.get("time")),
+        )
+        if rp.get("ext_xml"):
+            try:
+                wrapped = ET.fromstring(f"<root>{rp['ext_xml']}</root>")
+                for child in wrapped:
+                    pt.extensions.append(child)
+            except Exception:
+                pass
+        seg.points.append(pt)
+
+    return g.to_xml()
+
+
+def track_to_json(result_points):
+    """Convert internal result_points (datetime times) to JSON-safe track dicts."""
+    return [
+        {
+            "lat": p["lat"], "lon": p["lon"], "ele": p.get("ele"),
+            "time": _iso(p.get("time")), "ext_xml": p.get("ext_xml"),
+        }
+        for p in result_points
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Background processing worker
 # ---------------------------------------------------------------------------
 
@@ -222,7 +312,9 @@ def finalise_job(job_id):
         gpx_xml = build_gpx(job["gpx_obj"], result_points)
 
         job["result_gpx"]         = gpx_xml
-        job["result_full"]        = result_points  # full dicts (lat/lon/ele/time/ext) for elevation rebuild
+        job["result_full"]        = result_points  # full dicts (kept for legacy routes)
+        job["result_track"]       = track_to_json(result_points)  # JSON-safe, sent to frontend
+        job["meta"]               = extract_meta(job["gpx_obj"])
         job["result_points"]      = [{"lat": p["lat"], "lon": p["lon"]} for p in result_points]
         job["result_points_ele"]  = [p.get("ele") for p in result_points]
         job["segment_map"]        = segment_map
@@ -285,6 +377,8 @@ def status(job_id):
         resp["segment_map"] = job.get("segment_map", [])
         resp["summary"] = job.get("summary", {})
         resp["original_points"] = job.get("original_points", [])
+        resp["result_track"] = job.get("result_track", [])  # full track: frontend's source of truth
+        resp["meta"] = job.get("meta", {})
 
     if job["status"] == "error":
         resp["error"] = job.get("error", "Unknown error")
@@ -326,6 +420,174 @@ def submit_elevation(job_id):
     job["result_gpx"]        = build_gpx(job["gpx_obj"], pts)
     job["result_points_ele"] = [p.get("ele") for p in pts]
     return jsonify({"ok": True})
+
+
+@app.route("/submit_splice/<job_id>", methods=["POST"])
+def submit_splice(job_id):
+    """Replace straight-line dropout runs with road-routed geometry.
+
+    Each splice: {start, end, points:[{lat,lon}]} where start/end index into
+    the current result_full array. Inserted points get ele/time linearly
+    interpolated between the two endpoints by distance fraction.
+    """
+    job = jobs.get(job_id)
+    if not job or "result_full" not in job:
+        return jsonify({"error": "Result not ready"}), 404
+
+    splices = (request.get_json() or {}).get("splices", [])
+    pts = job["result_full"]
+    seg = job["segment_map"]
+
+    # Apply highest-index first so earlier indices stay valid
+    splices.sort(key=lambda s: s["start"], reverse=True)
+
+    for sp in splices:
+        s, e = sp["start"], sp["end"]
+        geo  = sp.get("points", [])
+        if e <= s or len(geo) < 2 or e >= len(pts):
+            continue
+
+        a, b = pts[s], pts[e]
+
+        # Cumulative distance along the new geometry → fraction for interpolation
+        cum = [0.0]
+        for i in range(1, len(geo)):
+            cum.append(cum[-1] + haversine(geo[i-1]["lat"], geo[i-1]["lon"], geo[i]["lat"], geo[i]["lon"]))
+        total = cum[-1] or 1.0
+
+        def lerp(va, vb, f):
+            if va is None or vb is None:
+                return va if va is not None else vb
+            return va + (vb - va) * f
+
+        a_t = a.get("time"); b_t = b.get("time")
+        new_pts = []
+        for i, g in enumerate(geo):
+            f = cum[i] / total
+            t = None
+            if a_t is not None and b_t is not None:
+                t = a_t + (b_t - a_t) * f
+            new_pts.append({
+                "lat": g["lat"], "lon": g["lon"],
+                "ele": lerp(a.get("ele"), b.get("ele"), f),
+                "time": t,
+                "ext_xml": None,
+            })
+
+        pts[s:e+1] = new_pts
+        seg[s:e+1] = ["spliced"] * len(new_pts)
+
+    # Rebuild everything
+    job["result_full"]       = pts
+    job["segment_map"]       = seg
+    job["result_gpx"]        = build_gpx(job["gpx_obj"], pts)
+    job["result_points"]     = [{"lat": p["lat"], "lon": p["lon"]} for p in pts]
+    job["result_points_ele"] = [p.get("ele") for p in pts]
+
+    total_pts   = len(seg)
+    snapped_pts = sum(1 for t in seg if t in ("snapped", "spliced"))
+    result_dist = total_distance_m([(p["lat"], p["lon"]) for p in pts])
+    job["summary"] = {
+        "total_points":        total_pts,
+        "snapped_points":      snapped_pts,
+        "unsnapped_points":    total_pts - snapped_pts,
+        "snapped_pct":         round(100 * snapped_pts / total_pts, 1) if total_pts else 0,
+        "unsnapped_pct":       round(100 * (total_pts - snapped_pts) / total_pts, 1) if total_pts else 0,
+        "total_distance_m":    result_dist,
+        "original_distance_m": job.get("total_distance_m", 0),
+    }
+
+    return jsonify({
+        "ok": True,
+        "result_points":     job["result_points"],
+        "result_points_ele": job["result_points_ele"],
+        "segment_map":       seg,
+        "summary":           job["summary"],
+    })
+
+
+@app.route("/splice", methods=["POST"])
+def splice():
+    """Stateless splice. Body: { track:[...], segment_map:[...], splices:[{start,end,points}] }.
+    Returns the updated track + derived arrays. Holds no server state.
+    """
+    data = request.get_json() or {}
+    track = data.get("track", [])
+    seg   = data.get("segment_map", [])
+    splices = data.get("splices", [])
+    if not track:
+        return jsonify({"error": "No track provided"}), 400
+    if len(seg) != len(track):
+        seg = ["original"] * len(track)
+
+    splices.sort(key=lambda s: s["start"], reverse=True)
+    for sp in splices:
+        s, e = sp["start"], sp["end"]
+        geo  = sp.get("points", [])
+        if e <= s or len(geo) < 2 or e >= len(track):
+            continue
+        a, b = track[s], track[e]
+
+        cum = [0.0]
+        for i in range(1, len(geo)):
+            cum.append(cum[-1] + haversine(geo[i-1]["lat"], geo[i-1]["lon"], geo[i]["lat"], geo[i]["lon"]))
+        total = cum[-1] or 1.0
+
+        a_t = _parse_iso(a.get("time")); b_t = _parse_iso(b.get("time"))
+        a_e = a.get("ele"); b_e = b.get("ele")
+
+        new_pts = []
+        for i, g in enumerate(geo):
+            f = cum[i] / total
+            t = None
+            if a_t is not None and b_t is not None:
+                t = _iso(a_t + (b_t - a_t) * f)
+            ele = None
+            if a_e is not None and b_e is not None:
+                ele = a_e + (b_e - a_e) * f
+            elif a_e is not None:
+                ele = a_e
+            new_pts.append({"lat": g["lat"], "lon": g["lon"], "ele": ele, "time": t, "ext_xml": None})
+
+        track[s:e+1] = new_pts
+        seg[s:e+1]   = ["spliced"] * len(new_pts)
+
+    total_pts   = len(seg)
+    snapped_pts = sum(1 for t in seg if t in ("snapped", "spliced"))
+    result_dist = total_distance_m([(p["lat"], p["lon"]) for p in track])
+    summary = {
+        "total_points":        total_pts,
+        "snapped_points":      snapped_pts,
+        "unsnapped_points":    total_pts - snapped_pts,
+        "snapped_pct":         round(100 * snapped_pts / total_pts, 1) if total_pts else 0,
+        "unsnapped_pct":       round(100 * (total_pts - snapped_pts) / total_pts, 1) if total_pts else 0,
+        "total_distance_m":    result_dist,
+        "original_distance_m": data.get("original_distance_m", result_dist),
+    }
+
+    return jsonify({
+        "ok": True,
+        "track":             track,
+        "segment_map":       seg,
+        "result_points":     [{"lat": p["lat"], "lon": p["lon"]} for p in track],
+        "result_points_ele": [p.get("ele") for p in track],
+        "summary":           summary,
+    })
+
+
+@app.route("/build_gpx", methods=["POST"])
+def build_gpx_route():
+    """Stateless GPX builder. Body: { track:[...], meta:{...} } → GPX file download."""
+    data  = request.get_json() or {}
+    track = data.get("track", [])
+    meta  = data.get("meta", {})
+    if not track:
+        return jsonify({"error": "No track provided"}), 400
+
+    gpx_xml = build_gpx_stateless(track, meta)
+    buf = io.BytesIO(gpx_xml.encode("utf-8"))
+    buf.seek(0)
+    return send_file(buf, mimetype="application/gpx+xml", as_attachment=True, download_name="snapped.gpx")
 
 
 @app.route("/download/<job_id>", methods=["GET"])

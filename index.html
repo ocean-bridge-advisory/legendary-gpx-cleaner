@@ -629,24 +629,19 @@ async function handleStatus(data) {
 }
 
 // ============================================================
-// ORS SNAPPING — DENSE RESAMPLE + BISECTION ENGINE
+// ORS SNAPPING — JUNCTION-TO-JUNCTION ROUTE & VERIFY
 // ============================================================
 //
-// Why this design:
-//   ORS routes the "recommended" path BETWEEN the waypoints you give it.
-//   Sparse waypoints (e.g. 3 over 500m) let ORS pick a different road than
-//   the one actually ridden, so the snapped path deviates and the segment is
-//   rejected. The fix is to send waypoints densely enough (~every 35m) that
-//   ORS is physically constrained to the real road. We chunk the resampled
-//   waypoints into <=25-point requests, break chunks at detected junctions
-//   for clean turns, and on any rejected chunk we recursively bisect so a
-//   genuinely off-road stretch (tunnel, beach path, GPS gap) is isolated to a
-//   small orange segment instead of discarding a long good one.
+// Detect major junctions from the GPS trace, route each junction → next
+// junction with just two waypoints (ORS finds the road), then compare the
+// routed leg against the GPS points. If it matches within DEVIATION_LIMIT,
+// accept it; if not, a junction was missed inside the leg, so insert the
+// midpoint as a new junction and re-route each half (recursively). This keeps
+// the number of ORS calls close to the number of real junctions.
 //
-const RESAMPLE_M     = 35;  // target waypoint spacing sent to ORS (metres)
-const CHUNK_WPTS     = 25;  // max waypoints per ORS request
-const MAX_DEPTH      = 4;   // bisection recursion depth on failed chunks
-const MIN_SEG_POINTS = 8;   // stop bisecting below this many original points
+const RESAMPLE_M     = 35;  // coarse spacing used only for junction detection (m)
+const MAX_DEPTH      = 8;   // max midpoint-insertion recursion depth per leg
+const MIN_SEG_POINTS = 6;   // stop subdividing below this many GPS points
 
 // --- Geometry helpers ---
 function bearing(lat1, lon1, lat2, lon2) {
@@ -694,24 +689,6 @@ function detectJunctions(pts) {
     if (bearingDiff(b1, b2) >= BEARING_THRESHOLD) set.add(coarse[i]);
   }
   return { set, coarse };
-}
-
-// Build chunks over coarse waypoints, capped at CHUNK_WPTS, broken at junctions.
-// Each chunk is an original-index range [s, e]; consecutive chunks overlap by 1.
-function buildChunks(coarse, junctionSet) {
-  const chunks = [];
-  let start = 0;
-  while (start < coarse.length - 1) {
-    let end = Math.min(start + CHUNK_WPTS - 1, coarse.length - 1);
-    let jb = -1;
-    for (let k = end; k > start + 1; k--) {
-      if (junctionSet.has(coarse[k])) { jb = k; break; }
-    }
-    if (jb !== -1) end = jb;
-    chunks.push([coarse[start], coarse[end]]);
-    start = end; // overlap by 1 shared point
-  }
-  return chunks;
 }
 
 // --- ORS call: globally throttled + 429 backoff ---
@@ -770,79 +747,78 @@ function pinBoundaries(snapped, start, end) {
   return [{ lat: start.lat, lon: start.lon }, ...snapped.slice(1, -1), { lat: end.lat, lon: end.lon }];
 }
 
-// Try to snap original range [s..e]. Tries each profile and accepts the FIRST
-// whose snapped path stays within DEVIATION_LIMIT of the original everywhere.
-// Returns snapped [{lat,lon}] or null.
-async function trySnapRange(pts, s, e) {
-  const idxs = resampleRange(pts, s, e, RESAMPLE_M, CHUNK_WPTS);
-  if (idxs.length < 2) return null;
-  const wpts      = idxs.map(k => ({ lat: pts[k].lat, lon: pts[k].lon }));
-  const origSlice = pts.slice(s, e + 1);
+// ============================================================
+// JUNCTION-TO-JUNCTION SNAPPING
+// ============================================================
+// 1. Detect major junctions (bearing changes) from the GPS trace.
+// 2. Route each junction[i] → junction[i+1] with just 2 waypoints — ORS finds
+//    the road. Few waypoints = few ORS calls = fast.
+// 3. Compare the routed leg against the GPS points in that span. If max
+//    deviation is within DEVIATION_LIMIT, accept (the road matched). If not,
+//    a junction was missed inside the span: insert the midpoint as a new
+//    junction and re-route each half. Recurse until each leg passes or the
+//    span is too short to split.
 
+// Try to route original range [s..e] using ONLY the two endpoints (no shaping
+// points). Returns the snapped geometry if it stays within DEVIATION_LIMIT of
+// the GPS trace, else null. Tries the profile fallback chain.
+async function routeLeg(pts, s, e) {
+  const wpts      = [{ lat: pts[s].lat, lon: pts[s].lon }, { lat: pts[e].lat, lon: pts[e].lon }];
+  const origSlice = pts.slice(s, e + 1);
   for (const profile of ORS_PROFILES) {
     let raw;
     try { raw = await orsRoute(profile, wpts); }
-    catch (_) { continue; }
-    const pinned = pinBoundaries(raw, wpts[0], wpts[wpts.length - 1]);
+    catch (err) { if (err.message === "__ABORTED__") throw err; continue; }
+    const pinned = pinBoundaries(raw, wpts[0], wpts[1]);
     if (maxDeviation(pinned, origSlice) <= DEVIATION_LIMIT) return pinned;
   }
   return null;
 }
 
-// Pass-2 recursion: snap [s..e]; if it fails and is long enough, bisect and
-// recurse so off-road sub-stretches are isolated to small segments.
-async function bisectSnap(pts, s, e, depth, out) {
-  const snapped = await trySnapRange(pts, s, e);
-  if (snapped) { out.push({ start_idx: s, end_idx: e, result: snapped }); return; }
+// Recursively snap a junction-to-junction span. On failure, insert the midpoint
+// as a new junction and re-route each half. `out` collects contiguous segments.
+async function snapLeg(pts, s, e, depth, out, progress) {
+  const snapped = await routeLeg(pts, s, e);
+  if (snapped) {
+    out.push({ start_idx: s, end_idx: e, result: snapped });
+    progress.done++;
+    return;
+  }
+  // Missed junction inside [s..e] (or genuinely off-road). Split at midpoint.
   if (depth >= MAX_DEPTH || (e - s) <= MIN_SEG_POINTS) {
     out.push({ start_idx: s, end_idx: e, result: null }); // keep original
+    progress.done++;
     return;
   }
   const mid = s + Math.floor((e - s) / 2);
-  await bisectSnap(pts, s, mid, depth + 1, out); // halves share `mid`
-  await bisectSnap(pts, mid, e, depth + 1, out);
+  progress.total++;  // one leg became two
+  await snapLeg(pts, s, mid, depth + 1, out, progress);  // halves share `mid`
+  await snapLeg(pts, mid, e, depth + 1, out, progress);
 }
 
 // --- Main ---
 async function snapAllSegments(origPts) {
   try {
-    const { set: junctionSet, coarse } = detectJunctions(origPts);
-    const chunks = buildChunks(coarse, junctionSet);
+    // Junction list = sorted original indices (always includes 0 and last)
+    const { set: junctionSet } = detectJunctions(origPts);
+    const junctions = [...junctionSet].sort((a, b) => a - b);
+    const legCount  = junctions.length - 1;
 
-    // PASS 1 — dense snap per chunk
-    document.getElementById("s-segs").textContent = `${chunks.length}`;
-    const pass1 = []; // { s, e, snapped }
-    for (let i = 0; i < chunks.length; i++) {
-      const [s, e] = chunks[i];
-      setProgress(Math.round(5 + 50 * (i + 1) / chunks.length));
-      setStatus("working", `Pass 1 — segment ${i+1} / ${chunks.length}`);
-      pass1.push({ s, e, snapped: await trySnapRange(origPts, s, e) });
-    }
+    document.getElementById("s-segs").textContent = `${legCount} junctions`;
+    setStatus("working", `Routing ${legCount} junction legs…`);
 
-    // PASS 2 — recursive bisection on rejected chunks
-    const failed = pass1.filter(p => p.snapped === null);
-    document.getElementById("s-segs").textContent = `${chunks.length} (${failed.length} refining)`;
+    const ordered  = [];
+    const progress = { done: 0, total: legCount };
 
-    const ordered = []; // final contiguous segment list for backend
-    let p2done = 0;
-    for (const p of pass1) {
-      if (p.snapped !== null) {
-        ordered.push({ start_idx: p.s, end_idx: p.e, result: p.snapped });
-        continue;
-      }
-      p2done++;
-      setProgress(Math.round(56 + 40 * p2done / Math.max(failed.length, 1)));
-      setStatus("working", `Pass 2 — refining gap ${p2done} / ${failed.length}`);
-
-      if ((p.e - p.s) <= MIN_SEG_POINTS) {
-        ordered.push({ start_idx: p.s, end_idx: p.e, result: null });
-      } else {
-        const sub = [];
-        const mid = p.s + Math.floor((p.e - p.s) / 2);
-        await bisectSnap(origPts, p.s, mid, 1, sub);
-        await bisectSnap(origPts, mid, p.e, 1, sub);
-        for (const x of sub) ordered.push(x);
-      }
+    for (let i = 0; i < legCount; i++) {
+      await snapLeg(origPts, junctions[i], junctions[i + 1], 0, ordered, progress);
+      const pct = Math.round(5 + 90 * progress.done / Math.max(progress.total, 1));
+      setProgress(Math.min(pct, 95));
+      const refined = progress.total - legCount;
+      setStatus("working",
+        refined > 0
+          ? `Routing legs… ${progress.done}/${progress.total} (${refined} missed junctions found)`
+          : `Routing legs… ${progress.done}/${progress.total}`);
     }
 
     // Submit
@@ -856,7 +832,7 @@ async function snapAllSegments(origPts) {
 
     startPolling();
   } catch (e) {
-    if (e.message === "__ABORTED__") return;  // abortJob already updated UI
+    if (e.message === "__ABORTED__") return;
     showError(e.message);
   }
 }
